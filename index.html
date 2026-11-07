@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vectorious – Image to SVG</title>
+  <meta name="description" content="Convert raster images (PNG, JPG, WebP, GIF, BMP) to detailed SVG vectors, right in your browser. Classic tracing algorithms, no AI, nothing uploaded.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%236c5ce7'/%3E%3Cpath d='M7 9l9 15 9-15' fill='none' stroke='white' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="var(--accent)"/><path d="M7 9l9 15 9-15" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>Vectorious</span>
+    </div>
+    <p class="tagline">Raster → SVG, traced in your browser. No AI, no uploads.</p>
+    <div class="top-actions">
+      <label class="btn" for="file">Open image</label>
+      <button class="btn" id="sample" type="button">Try a sample</button>
+      <button class="btn primary" id="download" type="button" disabled>Download SVG</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="panel" id="panel">
+      <section class="group">
+        <label class="field">
+          <span>Preset</span>
+          <select id="preset">
+            <option value="max">Maximum detail</option>
+            <option value="photo">Photo</option>
+            <option value="illustration" selected>Illustration / logo</option>
+            <option value="lineart">Line art (black &amp; white)</option>
+            <option value="pixel">Pixel art (exact)</option>
+            <option value="custom">Custom</option>
+          </select>
+        </label>
+      </section>
+
+      <section class="group">
+        <h2>Color</h2>
+        <label class="field">
+          <span>Mode</span>
+          <select id="mode">
+            <option value="color">Color</option>
+            <option value="gray">Grayscale</option>
+            <option value="bw">Black &amp; white</option>
+          </select>
+        </label>
+        <label class="field range" data-show="color gray">
+          <span>Colors <output for="colors"></output></span>
+          <input type="range" id="colors" min="2" max="128" step="1" value="16">
+          <small>More colors keep more tonal detail.</small>
+        </label>
+        <label class="field range" data-show="bw">
+          <span>Threshold <output for="threshold"></output></span>
+          <input type="range" id="threshold" min="1" max="254" step="1" value="128">
+          <small>Pixels darker than this become black, the rest white.</small>
+        </label>
+        <label class="check" data-show="bw"><input type="checkbox" id="bwBackground" checked> Solid background (no transparency)</label>
+        <label class="check" data-show="bw"><input type="checkbox" id="invert"> Swap black and white</label>
+      </section>
+
+      <section class="group">
+        <h2>Detail</h2>
+        <label class="field range">
+          <span>Resolution <output for="scale"></output></span>
+          <input type="range" id="scale" min="0.25" max="4" step="0.25" value="1">
+          <small>Upscale small images for finer curves. Slower at high values.</small>
+        </label>
+        <label class="field range">
+          <span>Denoise <output for="blur"></output></span>
+          <input type="range" id="blur" min="0" max="6" step="1" value="0">
+          <small>Blur before tracing. Helps with photos and JPEG artifacts.</small>
+        </label>
+        <label class="field range">
+          <span>Speckle filter <output for="speckle"></output></span>
+          <input type="range" id="speckle" min="0" max="200" step="1" value="4">
+          <small>Regions smaller than this many pixels are merged away.</small>
+        </label>
+      </section>
+
+      <section class="group">
+        <h2>Curves</h2>
+        <label class="check"><input type="checkbox" id="pixelExact"> Pixel-exact edges (no curve fitting)</label>
+        <label class="field range" data-curves>
+          <span>Smoothness <output for="alphamax"></output></span>
+          <input type="range" id="alphamax" min="0" max="1.33" step="0.01" value="1">
+          <small>0 keeps every corner sharp, higher rounds corners into curves.</small>
+        </label>
+        <label class="check" data-curves><input type="checkbox" id="opticurve" checked> Simplify curves</label>
+        <label class="field range" data-curves>
+          <span>Simplify tolerance <output for="opttolerance"></output></span>
+          <input type="range" id="opttolerance" min="0.05" max="1.5" step="0.05" value="0.2">
+          <small>Lower is more faithful, higher gives smaller files.</small>
+        </label>
+      </section>
+
+      <section class="group">
+        <h2>Output</h2>
+        <label class="field">
+          <span>Layering</span>
+          <select id="layering">
+            <option value="stacked">Stacked (no gaps between shapes)</option>
+            <option value="cutout">Cutout (shapes don't overlap)</option>
+          </select>
+        </label>
+        <label class="field" data-stacked>
+          <span>Layer order</span>
+          <select id="order">
+            <option value="lightness">By brightness (smoothest edges)</option>
+            <option value="area">By area (largest at bottom)</option>
+          </select>
+        </label>
+        <label class="check"><input type="checkbox" id="auto" checked> Re-trace automatically</label>
+        <button class="btn primary wide" id="trace" type="button" disabled>Trace now</button>
+      </section>
+    </aside>
+
+    <section class="stage-wrap">
+      <div class="viewbar">
+        <div class="seg" role="tablist" aria-label="View">
+          <button type="button" data-view="split" class="on">Compare</button>
+          <button type="button" data-view="svg">Vector</button>
+          <button type="button" data-view="outline">Outlines</button>
+          <button type="button" data-view="original">Original</button>
+        </div>
+        <div class="zoom">
+          <button type="button" class="icon" id="zoomOut" aria-label="Zoom out">−</button>
+          <span id="zoomLabel">100%</span>
+          <button type="button" class="icon" id="zoomIn" aria-label="Zoom in">+</button>
+          <button type="button" class="btn small" id="zoomFit">Fit</button>
+          <button type="button" class="btn small" id="zoom1">1:1</button>
+        </div>
+      </div>
+
+      <div class="stage" id="stage" tabindex="0">
+        <div class="drop" id="drop">
+          <div>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0l-4 4m4-4l4 4M4 16v3a1 1 0 001 1h14a1 1 0 001-1v-3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <p><strong>Drop an image here</strong>, paste one, or <label for="file" class="link">browse</label>.</p>
+            <p class="muted">PNG, JPG, WebP, GIF, BMP. Your image never leaves this device.</p>
+          </div>
+        </div>
+        <div class="canvas" id="canvas" hidden>
+          <img id="imgOriginal" alt="Original image" draggable="false">
+          <img id="imgVector" alt="Vectorized result" draggable="false">
+        </div>
+        <div class="divider" id="divider" hidden><span></span></div>
+        <div class="busy" id="busy" hidden>
+          <div class="bar"><div id="busyBar"></div></div>
+          <span id="busyText">Tracing…</span>
+        </div>
+      </div>
+
+      <footer class="statusbar">
+        <div id="stats" class="stats">Open an image to begin.</div>
+        <div id="palette" class="palette" aria-label="Palette"></div>
+        <button class="btn small" id="copy" type="button" disabled>Copy SVG</button>
+      </footer>
+    </section>
+  </main>
+
+  <input type="file" id="file" accept="image/*" hidden>
+  <script src="js/tracer.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
