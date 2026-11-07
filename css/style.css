@@ -183,11 +183,38 @@ body {
 .palette { display: flex; flex-wrap: wrap; gap: 3px; max-width: 45%; }
 .palette i { width: 14px; height: 14px; border-radius: 3px; border: 1px solid rgba(127, 127, 127, .35); display: block; }
 
+/* ---------- layers panel ---------- */
+.layers-panel { width: 280px; border-right: 0; border-left: 1px solid var(--line); }
+.layer-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; font-size: 13px; }
+.layer-tools { display: flex; gap: 4px; flex: none; }
+.layer-list { list-style: none; margin: 0 0 8px; padding: 0; }
+.layer {
+  display: flex; align-items: center; gap: 8px; padding: 6px 4px; border-radius: 8px;
+  border-bottom: 1px solid var(--line);
+}
+.layer:hover { background: var(--field); }
+.layer input { accent-color: var(--accent); flex: none; margin: 0; width: 16px; height: 16px; cursor: pointer; }
+.layer.off .swatches, .layer.off .layer-name { opacity: .4; }
+.swatches { display: flex; flex: none; }
+.swatches i {
+  width: 14px; height: 18px; display: block; border: 1px solid rgba(127, 127, 127, .35);
+}
+.swatches i:first-child { border-radius: 4px 0 0 4px; }
+.swatches i:last-child { border-radius: 0 4px 4px 0; }
+.swatches i + i { border-left: 0; }
+.layer-name { flex: 1; min-width: 0; font-weight: 550; cursor: pointer; overflow-wrap: anywhere; line-height: 1.3; }
+.layer-name small { display: block; color: var(--muted); font-weight: 400; font-size: 12px; }
+.layer .icon { flex: none; display: grid; place-items: center; padding: 0; }
+.layer .icon svg { width: 16px; height: 16px; }
+.layer-tip { display: block; font-size: 12px; margin-top: 8px; }
+
 /* ---------- narrow screens ---------- */
 @media (max-width: 800px) {
   body { height: auto; }
-  .layout { flex-direction: column-reverse; }
-  .panel { width: 100%; border-right: 0; border-top: 1px solid var(--line); }
+  .layout { flex-direction: column; }
+  .stage-wrap { order: 1; }
+  .panel.layers-panel { order: 2; }
+  .panel { order: 3; width: 100%; border-right: 0; border-left: 0; border-top: 1px solid var(--line); overflow: visible; }
   .stage { height: 60vh; flex: none; }
   .tagline { display: none; }
   .zoom { margin-left: 0; }

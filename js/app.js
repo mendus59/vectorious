@@ -11,12 +11,20 @@
     lineart:      { mode: 'bw', threshold: 128, invert: false, bwBackground: true, scale: 2, blur: 0, speckle: 8, alphamax: 1, opticurve: true, opttolerance: 0.2, pixelExact: false, layering: 'stacked', order: 'lightness' },
     pixel:        { mode: 'color', colors: 64, scale: 1, blur: 0, speckle: 0, alphamax: 0, opticurve: false, opttolerance: 0.2, pixelExact: true, layering: 'stacked', order: 'lightness' }
   };
-  var CONTROL_IDS = ['mode', 'colors', 'threshold', 'invert', 'bwBackground', 'scale', 'blur', 'speckle', 'pixelExact', 'alphamax', 'opticurve', 'opttolerance', 'layering', 'order'];
+  var CONTROL_IDS = ['mode', 'colors', 'threshold', 'invert', 'bwBackground', 'scale', 'blur', 'speckle', 'pixelExact', 'alphamax', 'opticurve', 'opttolerance', 'layering', 'order', 'groupBy', 'maxLayers'];
+
+  var GROUP_HINTS = {
+    color: 'One layer per color, with similar colors merged.',
+    shape: 'Round, rectangular, pointed, thin and complex shapes each get a layer.',
+    size: 'Large shapes, medium shapes, small shapes and fine details each get a layer.',
+    similar: 'Shapes that look alike in size, outline and color are clustered together.'
+  };
 
   var $ = function (id) { return document.getElementById(id); };
   var els = {};
   ['file', 'sample', 'download', 'copy', 'trace', 'auto', 'preset', 'stage', 'drop', 'canvas', 'imgOriginal', 'imgVector',
-   'divider', 'busy', 'busyBar', 'busyText', 'stats', 'palette', 'zoomIn', 'zoomOut', 'zoomFit', 'zoom1', 'zoomLabel']
+   'divider', 'busy', 'busyBar', 'busyText', 'stats', 'palette', 'zoomIn', 'zoomOut', 'zoomFit', 'zoom1', 'zoomLabel',
+   'groupBy', 'groupHint', 'layerList', 'layerSummary', 'layersAll', 'layersNone', 'downloadVisible']
     .forEach(function (id) { els[id] = $(id); });
 
   var state = {
@@ -25,7 +33,8 @@
     view: 'split', split: 0.5,
     zoom: 1, tx: 0, ty: 0,
     jobId: 0, worker: null, workerOk: typeof Worker !== 'undefined',
-    pending: null
+    pending: null,
+    open: null, layers: [], hidden: {}
   };
 
   // ------------------------------------------------------------------
@@ -46,7 +55,9 @@
       opticurve: $('opticurve').checked,
       opttolerance: +$('opttolerance').value,
       layering: $('layering').value,
-      order: $('order').value
+      order: $('order').value,
+      groupBy: $('groupBy').value,
+      maxLayers: +$('maxLayers').value
     };
   }
 
@@ -69,9 +80,17 @@
     document.querySelectorAll('[data-curves]').forEach(function (el) {
       el.classList.toggle('disabled-field', exact);
     });
+    var groupBy = $('groupBy').value, objectLayers = groupBy !== 'color';
     document.querySelectorAll('[data-stacked]').forEach(function (el) {
-      el.classList.toggle('disabled-field', $('layering').value !== 'stacked');
+      el.classList.toggle('disabled-field', objectLayers || $('layering').value !== 'stacked');
     });
+    $('layering').closest('.field').classList.toggle('disabled-field', objectLayers);
+    document.querySelectorAll('[data-group]').forEach(function (el) {
+      el.hidden = el.getAttribute('data-group').split(' ').indexOf(groupBy) < 0;
+    });
+    els.groupHint.textContent = GROUP_HINTS[groupBy] +
+      (objectLayers ? ' Each shape is traced on its own (cutout), so layers never cover each other.'
+        : $('layering').value === 'stacked' ? ' With Stacked layering a layer also fills in under the layers above it. Pick Cutout for layers that stand alone.' : '');
     $('opttolerance').closest('.field').classList.toggle('disabled-field', exact || !opt);
     document.querySelectorAll('output[for]').forEach(function (out) {
       var input = $(out.getAttribute('for')), v = +input.value;
@@ -86,6 +105,7 @@
 
   var debounceTimer = 0;
   function onControlChange(e) {
+    if (e && e.target && e.target.id === 'groupBy') state.hidden = {};
     $('preset').value = 'custom';
     refreshControls();
     saveSettings();
@@ -134,6 +154,7 @@
     state.image = img;
     state.origUrl = url;
     state.name = name;
+    state.hidden = {};
     state.w = img.naturalWidth;
     state.h = img.naturalHeight;
     els.imgOriginal.src = url;
@@ -214,6 +235,7 @@
       alphamax: opts.pixelExact ? 0 : opts.alphamax,
       opticurve: opts.opticurve, opttolerance: opts.opttolerance,
       pixelExact: opts.pixelExact, layering: opts.layering, order: opts.order,
+      groupBy: opts.groupBy, maxLayers: opts.maxLayers,
       outWidth: state.w, outHeight: state.h
     };
     if (opts.blur > 0 && options.blur < 1) options.blur = 1;
@@ -249,7 +271,7 @@
         if (id !== state.jobId) return;
         try {
           var r = window.Vectorious.vectorize(imgData, options);
-          onResult({ svg: r.svg, palette: r.palette, stats: r.stats }, imgData, performance.now() - started);
+          onResult({ svg: r.svg, open: r.open, layers: r.layers, palette: r.palette, stats: r.stats }, imgData, performance.now() - started);
         } catch (err) { showError(err); }
       }, 30);
     }
@@ -257,21 +279,17 @@
 
   function onResult(m, imgData, elapsed) {
     hideBusy();
-    state.svg = m.svg;
-    if (state.svgUrl) URL.revokeObjectURL(state.svgUrl);
-    if (state.outlineUrl) URL.revokeObjectURL(state.outlineUrl);
-    state.svgUrl = URL.createObjectURL(new Blob([m.svg], { type: 'image/svg+xml' }));
-    state.outlineUrl = null;
-    setVectorSrc();
-    els.download.disabled = false;
-    els.copy.disabled = false;
+    state.open = m.open;
+    state.layers = m.layers;
+    renderLayers();
+    rebuildVisible();
 
     var s = m.stats;
     els.stats.innerHTML =
       '<b>' + state.w + '×' + state.h + '</b> traced at ' + s.width + '×' + s.height +
-      ' · <b>' + s.colors + '</b> colors · <b>' + s.paths.toLocaleString() + '</b> shapes' +
+      ' · <b>' + s.colors + '</b> colors · <b>' + s.layers + '</b> layers · <b>' + s.paths.toLocaleString() + '</b> shapes' +
       (s.segments ? ' · ' + s.segments.toLocaleString() + ' segments' : '') +
-      ' · <b>' + formatBytes(s.bytes) + '</b> · ' + (elapsed / 1000).toFixed(2) + ' s' +
+      ' · <b>' + formatBytes(s.bytes) + '</b> in all · ' + (elapsed / 1000).toFixed(2) + ' s' +
       (s.bytes > 25e6 ? ' · <b>Very large file.</b> For photos try the Photo preset, Denoise, or a higher Speckle filter.' : '');
     els.palette.innerHTML = '';
     m.palette.slice(0, 128).forEach(function (hex) {
@@ -280,6 +298,112 @@
       i.title = hex;
       els.palette.appendChild(i);
     });
+  }
+
+  // ------------------------------------------------------------------
+  // Layers: visibility and per-layer download
+  // ------------------------------------------------------------------
+  function visibleLayers() {
+    return state.layers.filter(function (l) { return !state.hidden[l.name]; });
+  }
+
+  function rebuildVisible() {
+    var vis = visibleLayers();
+    state.svg = window.Vectorious.buildSvg(state.open, vis);
+    if (state.svgUrl) URL.revokeObjectURL(state.svgUrl);
+    if (state.outlineUrl) URL.revokeObjectURL(state.outlineUrl);
+    state.svgUrl = URL.createObjectURL(new Blob([state.svg], { type: 'image/svg+xml' }));
+    state.outlineUrl = null;
+    setVectorSrc();
+    var none = !vis.length, all = vis.length === state.layers.length;
+    els.download.disabled = none;
+    els.copy.disabled = none;
+    els.downloadVisible.disabled = none;
+    els.download.textContent = all ? 'Download SVG' : 'Download visible';
+    els.layersAll.disabled = all;
+    els.layersNone.disabled = none;
+    els.layerSummary.textContent = vis.length + ' of ' + state.layers.length + ' layers shown · ' + formatBytes(state.svg.length);
+    els.layerList.querySelectorAll('li').forEach(function (li) {
+      var on = !state.hidden[state.layers[+li.getAttribute('data-index')].name];
+      li.classList.toggle('off', !on);
+      li.querySelector('input').checked = on;
+    });
+  }
+
+  function renderLayers() {
+    els.layerList.innerHTML = '';
+    // top of the stack first, like a layers panel in an editor
+    for (var i = state.layers.length - 1; i >= 0; i--) {
+      var row = layerRow(state.layers[i]);
+      row.setAttribute('data-index', i);
+      els.layerList.appendChild(row);
+    }
+  }
+
+  function layerRow(layer) {
+    var li = document.createElement('li');
+    li.className = 'layer';
+    var box = document.createElement('input');
+    box.type = 'checkbox';
+    box.title = 'Show or hide. Alt-click to show only this layer.';
+    box.setAttribute('aria-label', 'Show ' + layer.name);
+    box.addEventListener('click', function (e) {
+      if (e.altKey) {
+        state.layers.forEach(function (l) { state.hidden[l.name] = l !== layer; });
+      } else if (box.checked) {
+        delete state.hidden[layer.name];
+      } else {
+        state.hidden[layer.name] = true;
+      }
+      rebuildVisible();
+    });
+    var sw = document.createElement('span');
+    sw.className = 'swatches';
+    layer.colors.slice(0, 5).forEach(function (c) {
+      var i = document.createElement('i');
+      i.style.background = c;
+      sw.appendChild(i);
+    });
+    if (layer.colors.length > 5) sw.title = layer.colors.length + ' colors';
+    var label = document.createElement('span');
+    label.className = 'layer-name';
+    label.textContent = layer.name;
+    var meta = document.createElement('small');
+    meta.textContent = layer.count.toLocaleString() + (layer.count === 1 ? ' shape' : ' shapes') +
+      (layer.colors.length > 1 ? ' · ' + layer.colors.length + ' colors' : '') + ' · ' + formatBytes(layer.body.length);
+    label.appendChild(meta);
+    label.addEventListener('click', function () { box.click(); });
+    var dl = document.createElement('button');
+    dl.type = 'button';
+    dl.className = 'icon';
+    dl.title = 'Download this layer as SVG';
+    dl.setAttribute('aria-label', 'Download ' + layer.name);
+    dl.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0l-4-4m4 4l4-4M5 19h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    dl.addEventListener('click', function () {
+      saveSvg(window.Vectorious.buildSvg(state.open, [layer]), state.name + '-' + layer.id + '.svg');
+    });
+    li.appendChild(box);
+    li.appendChild(sw);
+    li.appendChild(label);
+    li.appendChild(dl);
+    return li;
+  }
+
+  function saveSvg(text, filename) {
+    var url = URL.createObjectURL(new Blob([text], { type: 'image/svg+xml' }));
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+  }
+
+  function downloadVisible() {
+    if (!state.svg) return;
+    var all = visibleLayers().length === state.layers.length;
+    saveSvg(state.svg, state.name + (all ? '' : '-layers') + '.svg');
   }
 
   function outlineSvg(svg) {
@@ -412,14 +536,12 @@
   els.file.addEventListener('change', function () { if (els.file.files[0]) loadFile(els.file.files[0]); els.file.value = ''; });
   els.sample.onclick = makeSample;
   els.trace.onclick = trace;
-  els.download.onclick = function () {
-    if (!state.svg) return;
-    var a = document.createElement('a');
-    a.href = state.svgUrl;
-    a.download = state.name + '.svg';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
+  els.download.onclick = downloadVisible;
+  els.downloadVisible.onclick = downloadVisible;
+  els.layersAll.onclick = function () { state.hidden = {}; rebuildVisible(); };
+  els.layersNone.onclick = function () {
+    state.layers.forEach(function (l) { state.hidden[l.name] = true; });
+    rebuildVisible();
   };
   els.copy.onclick = function () {
     if (!state.svg || !navigator.clipboard) return;

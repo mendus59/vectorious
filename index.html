@@ -160,6 +160,39 @@
         <button class="btn small" id="copy" type="button" disabled>Copy SVG</button>
       </footer>
     </section>
+
+    <aside class="panel layers-panel" id="layersPanel" aria-label="Layers">
+      <section class="group">
+        <h2>Layers</h2>
+        <label class="field">
+          <span>Group by</span>
+          <select id="groupBy">
+            <option value="color">Color</option>
+            <option value="shape">Shape</option>
+            <option value="size">Size</option>
+            <option value="similar">Similar objects</option>
+          </select>
+          <small id="groupHint"></small>
+        </label>
+        <label class="field range" data-group="color similar">
+          <span>Max layers <output for="maxLayers"></output></span>
+          <input type="range" id="maxLayers" min="2" max="48" step="1" value="12">
+          <small>The most similar groups are merged until this many remain.</small>
+        </label>
+      </section>
+      <section class="group">
+        <div class="layer-head">
+          <span id="layerSummary" class="muted">Layers appear after tracing.</span>
+          <span class="layer-tools">
+            <button type="button" class="btn small" id="layersAll" disabled>All</button>
+            <button type="button" class="btn small" id="layersNone" disabled>None</button>
+          </span>
+        </div>
+        <ul class="layer-list" id="layerList"></ul>
+        <button class="btn primary wide" id="downloadVisible" type="button" disabled>Download visible layers</button>
+        <small class="muted layer-tip">Alt-click a checkbox to show only that layer. Downloads keep layers as groups that Illustrator and Inkscape open as layers.</small>
+      </section>
+    </aside>
   </main>
 
   <input type="file" id="file" accept="image/*" hidden>
