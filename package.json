@@ -1,0 +1,10 @@
+{
+  "name": "vectorious",
+  "version": "1.0.0",
+  "description": "Client-side raster to SVG vectorizer (classic tracing, no AI)",
+  "private": true,
+  "scripts": {
+    "test": "node test/tracer.test.js",
+    "start": "python3 -m http.server 8000"
+  }
+}
