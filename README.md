@@ -29,6 +29,19 @@ Convert raster images (PNG, JPG, WebP, GIF, BMP) into detailed SVG vector graphi
 | Simplify curves / tolerance | Potrace curve optimization |
 | Layering / Layer order | Stacked or cutout, and the stacking order |
 
+## Layers
+
+The Layers panel splits the result into layers you can show, hide, and download one at a time (or download every visible layer together). Alt-click a layer's checkbox to show only that layer. Every SVG keeps its layers as `<g>` groups that Illustrator and Inkscape open as layers.
+
+| Group by | How layers are made |
+| --- | --- |
+| Color | One layer per palette color. Similar colors (closest in OKLab) merge until at most *Max layers* remain. |
+| Shape | Each shape is measured with classic descriptors (fill of its minimum bounding rectangle, convexity, fit to an ellipse with the same second moments, elongation, stroke thickness) and sorted into round, rectangular, pointed, thin, or complex. |
+| Size | Large (≥ 10% of the image), medium (≥ 1%), small (≥ 0.1%), and fine details. |
+| Similar objects | k-means over size, shape descriptors, hole count, and color puts look-alike shapes in the same layer, up to *Max layers*. |
+
+Shape, size, and similar-object grouping trace each color region on its own (cutout), and each shape keeps its holes, so any layer stands alone.
+
 The preview supports compare (split slider), vector-only, outline, and original views, with zoom (wheel or buttons) and pan (drag).
 
 ## Running locally

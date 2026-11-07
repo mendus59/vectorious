@@ -35,7 +35,7 @@ test('two-color circle becomes a rect background + one curved path', () => {
 
 test('circle path stays near the true circle', () => {
   const r = V.vectorize(circle, { colors: 2, opticurve: false, order: 'area' });
-  const nums = r.svg.match(/d="([^"]+)"/)[1].match(/-?\d+(\.\d+)?/g).map(Number);
+  const nums = r.svg.match(/ d="([^"]+)"/)[1].match(/-?\d+(\.\d+)?/g).map(Number);
   // check every end point (every 2 numbers) lies within 1.5px of radius 30
   for (let i = 0; i < nums.length; i += 2) {
     const d = Math.hypot(nums[i] - 50, nums[i + 1] - 50);
@@ -50,14 +50,14 @@ test('square with hole keeps the hole', () => {
     return inOuter && !inHole ? [0, 0, 0] : [255, 255, 255];
   });
   const r = V.vectorize(img, { mode: 'bw' });
-  const d = r.svg.match(/d="([^"]+)"/)[1];
+  const d = r.svg.match(/ d="([^"]+)"/)[1];
   assert.strictEqual((d.match(/M/g) || []).length, 2, 'outer + hole');
 });
 
 test('pixel-exact mode outputs only axis-aligned edges', () => {
   const img = makeImage(8, 8, (x, y) => ((x + y) % 2 ? [0, 0, 0] : [255, 255, 255]));
   const r = V.vectorize(img, { pixelExact: true, speckle: 0, colors: 2 });
-  const d = r.svg.match(/d="([^"]+)"/)[1];
+  const d = r.svg.match(/ d="([^"]+)"/)[1];
   assert.ok(!/[CL]/.test(d), 'no curves or diagonals');
 });
 
@@ -84,6 +84,82 @@ test('speckle filter removes isolated pixels', () => {
 test('cutout layering traces each color separately', () => {
   const r = V.vectorize(circle, { colors: 2, layering: 'cutout' });
   assert.strictEqual((r.svg.match(/<path/g) || []).length, 2);
+});
+
+// One color, four kinds of shape on white.
+const shapes = makeImage(240, 160, (x, y) => {
+  const ink = [40, 40, 160];
+  if ((x - 50) ** 2 + (y - 50) ** 2 < 28 ** 2) return ink;                 // circle
+  if (x >= 110 && x < 160 && y >= 25 && y < 75) return ink;                // square
+  if (y >= 20 && y < 80 && Math.abs(x - 205) * 2 < (y - 20)) return ink;   // triangle
+  if (y >= 120 && y < 123 && x >= 20 && x < 220) return ink;               // thin line
+  return [255, 255, 255];
+});
+const layerOf = (r, re) => r.layers.find((l) => re.test(l.name));
+
+test('shape grouping sorts round, rectangular, pointed and thin shapes', () => {
+  const r = V.vectorize(shapes, { colors: 2, groupBy: 'shape' });
+  const names = r.layers.map((l) => l.name);
+  for (const re of [/Round/, /Rectangles/, /Triangles/, /Lines/]) {
+    const l = layerOf(r, re);
+    assert.ok(l, 'missing ' + re + ' in ' + names.join(', '));
+  }
+  assert.strictEqual(layerOf(r, /Round/).count, 1);
+  assert.strictEqual(layerOf(r, /Lines/).count, 1);
+  assert.ok(r.svg.includes('inkscape:groupmode="layer"'));
+});
+
+test('object grouping keeps holes with their shape', () => {
+  const ring = makeImage(80, 80, (x, y) => {
+    const d = (x - 40) ** 2 + (y - 40) ** 2;
+    return d < 30 ** 2 && d > 15 ** 2 ? [0, 0, 0] : [255, 255, 255];
+  });
+  const r = V.vectorize(ring, { colors: 2, groupBy: 'shape' });
+  const black = r.layers.find((l) => l.colors.includes('#000000'));
+  const d = black.body.match(/fill="#000000" fill-rule="evenodd" d="([^"]+)"/)[1];
+  assert.strictEqual((d.match(/M/g) || []).length, 2, 'ring outline + hole in one path');
+});
+
+test('size grouping separates big and small shapes', () => {
+  const img = makeImage(200, 200, (x, y) => {
+    if (x >= 20 && x < 120 && y >= 20 && y < 120) return [200, 0, 0];
+    if (x >= 150 && x < 156 && y >= 150 && y < 156) return [200, 0, 0];
+    return [255, 255, 255];
+  });
+  const r = V.vectorize(img, { colors: 2, groupBy: 'size' });
+  assert.ok(layerOf(r, /Large/) && layerOf(r, /Fine|Small/), r.layers.map((l) => l.name).join(', '));
+});
+
+test('similar-object grouping puts look-alikes together', () => {
+  const img = makeImage(300, 200, (x, y) => {
+    for (let i = 0; i < 3; i++) {
+      if ((x - (50 + i * 100)) ** 2 + (y - 60) ** 2 < 30 ** 2) return [220, 120, 0];
+      if (x >= 40 + i * 100 && x < 50 + i * 100 && y >= 150 && y < 160) return [0, 120, 60];
+    }
+    return [255, 255, 255];
+  });
+  const r = V.vectorize(img, { colors: 3, groupBy: 'similar', maxLayers: 3, speckle: 0 });
+  const counts = r.layers.map((l) => l.count).sort();
+  assert.deepStrictEqual(counts, [1, 3, 3]);
+});
+
+test('color grouping merges similar colors down to the layer limit', () => {
+  const img = makeImage(80, 80, (x, y) => {
+    if (x < 20) return [220, 20, 20];
+    if (x < 40) return [200, 30, 40];
+    if (x < 60) return [20, 20, 220];
+    return [30, 50, 200];
+  });
+  const r = V.vectorize(img, { colors: 4, maxLayers: 2, speckle: 0 });
+  assert.strictEqual(r.layers.length, 2);
+  assert.ok(r.layers.every((l) => l.colors.length === 2));
+});
+
+test('buildSvg writes only the layers it is given', () => {
+  const r = V.vectorize(shapes, { colors: 2, groupBy: 'shape' });
+  const one = V.buildSvg(r.open, [r.layers[1]]);
+  assert.strictEqual((one.match(/<g /g) || []).length, 1);
+  assert.ok(one.endsWith('</svg>'));
 });
 
 test('larger noisy image completes in reasonable time', () => {

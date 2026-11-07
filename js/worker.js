@@ -13,7 +13,7 @@ self.onmessage = function (e) {
         self.postMessage({ id: msg.id, type: 'progress', stage: stage, fraction: fraction });
       }
     });
-    self.postMessage({ id: msg.id, type: 'done', svg: result.svg, palette: result.palette, stats: result.stats });
+    self.postMessage({ id: msg.id, type: 'done', svg: result.svg, open: result.open, layers: result.layers, palette: result.palette, stats: result.stats });
   } catch (err) {
     self.postMessage({ id: msg.id, type: 'error', message: String(err && err.message || err) });
   }

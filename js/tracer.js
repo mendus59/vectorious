@@ -130,7 +130,7 @@
     }
 
     function findPath(px, py) {
-      var path = { pt: [], len: 0, area: 0, sign: atOrig(px, py) ? '+' : '-', minX: 1e9, minY: 1e9, maxX: -1, maxY: -1 };
+      var path = { pt: [], len: 0, area: 0, sign: atOrig(px, py) ? '+' : '-', sx: px, sy: py, minX: 1e9, minY: 1e9, maxX: -1, maxY: -1 };
       var x = px, y = py, dirx = 0, diry = 1, tmp;
       for (;;) {
         path.pt.push(new Pt(x, y));
@@ -1027,7 +1027,9 @@
     pixelExact: false,    // emit exact pixel-edge polygons, no curve fitting
     outWidth: 0,          // SVG width in user units (defaults to bitmap width)
     outHeight: 0,
-    decimals: 2
+    decimals: 2,
+    groupBy: 'color',     // layer grouping: 'color' | 'shape' | 'size' | 'similar'
+    maxLayers: 12         // 'color' / 'similar': merge until at most this many layers remain
   };
 
   /**
@@ -1062,17 +1064,47 @@
       polygonOnly: o.pixelExact
     };
 
-    // Serialize each layer as soon as it is traced so the heavy path
+    // Every path is serialized as soon as it is traced so the heavy path
     // structures can be garbage-collected (matters for large images).
     var pathCount = 0, segCount = 0;
-    function addLayer(color, paths) {
+    function pathD(path) {
+      if (o.pixelExact) return polygonToD(path, sx, sy, fmt);
+      segCount += path.curve.n;
+      return curveToD(path.curve, sx, sy, fmt);
+    }
+    function joinD(paths) {
       var ds = [];
-      for (var p = 0; p < paths.length; p++) {
-        if (o.pixelExact) ds.push(polygonToD(paths[p], sx, sy, fmt));
-        else { ds.push(curveToD(paths[p].curve, sx, sy, fmt)); segCount += paths[p].curve.n; }
-      }
+      for (var p = 0; p < paths.length; p++) ds.push(pathD(paths[p]));
       pathCount += paths.length;
-      layers.push({ color: color, d: ds.join('') });
+      return ds.join('');
+    }
+
+    var groupBy = GROUPINGS.indexOf(o.groupBy) >= 0 ? o.groupBy : 'color';
+    var objectMode = groupBy !== 'color';
+    var maxLayers = Math.max(1, (o.maxLayers | 0) || 12);
+    var background = null;  // solid backdrop color, its own layer at the bottom
+    var colorLayers = [];   // color grouping: [{ members: [color], items: [{ color, d | rect }] }]
+    var objects = [];       // object grouping: [{ d, color, f }]
+    var tracedArea = w * h;
+
+    // Object grouping: pair every outline with its holes so it can move
+    // between layers on its own, then measure its shape.
+    function collectObjects(paths, color) {
+      var outers = [], holes = [];
+      for (var p = 0; p < paths.length; p++) {
+        if (paths[p].sign === '+') outers.push({ outer: paths[p], holes: [] });
+        else holes.push(paths[p]);
+      }
+      if (holes.length) assignHoles(outers, holes, w, h);
+      for (var q = 0; q < outers.length; q++) {
+        var ob = outers[q], d = pathD(ob.outer), net = ob.outer.area;
+        for (var hh = 0; hh < ob.holes.length; hh++) { d += pathD(ob.holes[hh]); net -= ob.holes[hh].area; }
+        if (!d) continue;
+        var f = shapeFeatures(ob.outer, sx * sy);
+        f.holes = ob.holes.length;
+        f.net = net;
+        objects.push({ d: d, color: color, f: f });
+      }
     }
 
     var n = w * h, i;
@@ -1094,8 +1126,10 @@
       counts = [0];
       for (i = 0; i < n; i++) counts[0] += mask[i];
       progress('Tracing', 0.1);
-      if (o.bwBackground) layers.push({ color: o.invert ? [0, 0, 0] : [255, 255, 255], rect: true });
-      addLayer(palette[0], potrace(mask, w, h, tracerOpts));
+      if (o.bwBackground) background = o.invert ? [0, 0, 0] : [255, 255, 255];
+      var bwPaths = potrace(mask, w, h, tracerOpts);
+      if (objectMode) collectObjects(bwPaths, palette[0]);
+      else colorLayers.push({ members: [palette[0]], items: [{ color: palette[0], d: joinD(bwPaths) }] });
     } else {
       progress('Quantizing colors', 0);
       var q = quantize(px, w, h, Math.max(2, Math.min(256, o.colors | 0)), o, function (f) {
@@ -1110,73 +1144,438 @@
         for (i = 0; i < n; i++) if (indices[i] !== TRANSPARENT) counts[indices[i]]++;
       }
 
-      // Order: largest area first (drawn at the bottom).
-      var order = [];
-      for (i = 0; i < k; i++) if (counts[i] > 0) order.push(i);
-      if (o.order === 'lightness') {
-        // Dark to light: each stacked mask becomes a brightness iso-level,
-        // which keeps anti-aliased edges and gradients smooth.
-        var lumOf = function (c) { return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]; };
-        order.sort(function (a, b) { return lumOf(palette[a]) - lumOf(palette[b]); });
-        if (o.lightFirst) order.reverse();
+      var present = [];
+      for (i = 0; i < k; i++) if (counts[i] > 0) present.push(i);
+      var lumOf = function (c) { return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]; };
+      // Stacking key, smallest at the bottom. Lightness: dark to light, so each
+      // stacked mask becomes a brightness iso-level, which keeps anti-aliased
+      // edges and gradients smooth. Area: largest at the bottom.
+      var keyOf = o.order === 'lightness'
+        ? function (ix) { return o.lightFirst ? -lumOf(palette[ix]) : lumOf(palette[ix]); }
+        : function (ix) { return -counts[ix]; };
+
+      var lmask = new Uint8Array(n), li;
+      if (objectMode) {
+        // Objects come from each color region on its own (cutout), so a shape
+        // never hides part of another and every layer stands alone.
+        for (li = 0; li < present.length; li++) {
+          progress('Tracing', li / present.length);
+          var cix = present[li];
+          for (i = 0; i < n; i++) lmask[i] = indices[i] === cix ? 1 : 0;
+          collectObjects(potrace(lmask, w, h, tracerOpts), palette[cix]);
+        }
       } else {
-        order.sort(function (a, b) { return counts[b] - counts[a]; });
-      }
-      var rank = new Int32Array(k).fill(-1);
-      for (i = 0; i < order.length; i++) rank[order[i]] = i;
+        // Merge similar colors into at most maxLayers groups. Each group's
+        // colors stay next to each other in the stack so a group is one layer.
+        var groups = groupColors(present, palette, counts, maxLayers);
+        groups.forEach(function (g) {
+          g.sort(function (a, b) { return keyOf(a) - keyOf(b); });
+          var sum = 0, wsum = 0;
+          g.forEach(function (ix) { sum += keyOf(ix) * counts[ix]; wsum += counts[ix]; });
+          g.key = o.order === 'lightness' ? sum / wsum : -wsum;
+        });
+        groups.sort(function (a, b) { return a.key - b.key; });
+        var order = [], groupOf = [];
+        groups.forEach(function (g, gi) {
+          var members = [];
+          g.forEach(function (ix) { order.push(ix); groupOf.push(gi); members.push(palette[ix]); });
+          colorLayers.push({ members: members, items: [], weights: g.map(function (ix) { return counts[ix]; }) });
+        });
+        var rank = new Int32Array(k).fill(-1);
+        for (i = 0; i < order.length; i++) rank[order[i]] = i;
 
-      var hasTransparency = false;
-      for (i = 0; i < n; i++) if (indices[i] === TRANSPARENT) { hasTransparency = true; break; }
+        var hasTransparency = false;
+        for (i = 0; i < n; i++) if (indices[i] === TRANSPARENT) { hasTransparency = true; break; }
 
-      var stacked = o.layering !== 'cutout';
-      var lmask = new Uint8Array(n);
-      for (var li = 0; li < order.length; li++) {
-        progress('Tracing', li / order.length);
-        var color = palette[order[li]];
-        if (stacked && li === 0 && !hasTransparency) {
-          layers.push({ color: color, rect: true });
-          continue;
+        var stacked = o.layering !== 'cutout';
+        for (li = 0; li < order.length; li++) {
+          progress('Tracing', li / order.length);
+          var color = palette[order[li]], target = colorLayers[groupOf[li]];
+          if (stacked && li === 0 && !hasTransparency) {
+            target.items.push({ color: color, rect: true });
+            continue;
+          }
+          for (i = 0; i < n; i++) {
+            var ix = indices[i];
+            lmask[i] = ix === TRANSPARENT ? 0 : stacked ? (rank[ix] >= li ? 1 : 0) : (rank[ix] === li ? 1 : 0);
+          }
+          target.items.push({ color: color, d: joinD(potrace(lmask, w, h, tracerOpts)) });
         }
-        for (i = 0; i < n; i++) {
-          var ix = indices[i];
-          lmask[i] = ix === TRANSPARENT ? 0 : stacked ? (rank[ix] >= li ? 1 : 0) : (rank[ix] === li ? 1 : 0);
-        }
-        addLayer(color, potrace(lmask, w, h, tracerOpts));
       }
+    }
+
+    progress('Grouping layers', 1);
+    var defs = [];  // bottom to top: { name, items }
+    if (background) defs.push({ name: 'Background', items: [{ color: background, rect: true }] });
+    if (objectMode) {
+      pathCount += objects.length;
+      defs = defs.concat(groupObjects(objects, groupBy, maxLayers, tracedArea, sx * sy));
+    } else {
+      colorLayers.forEach(function (cl) {
+        var main = 0;
+        for (var m = 1; m < cl.members.length; m++) if (cl.weights && cl.weights[m] > cl.weights[main]) main = m;
+        var name = hex(cl.members[main]);
+        if (cl.members.length > 1) name += ' + ' + (cl.members.length - 1) + ' similar';
+        defs.push({ name: name, items: cl.items });
+      });
     }
 
     progress('Writing SVG', 1);
-    var parts = [];
-    parts.push('<svg xmlns="http://www.w3.org/2000/svg" width="' + fmt(outW) + '" height="' + fmt(outH) +
-               '" viewBox="0 0 ' + fmt(outW) + ' ' + fmt(outH) + '">');
-    for (var L = 0; L < layers.length; L++) {
-      var layer = layers[L], fill = hex(layer.color);
-      if (layer.rect) {
-        parts.push('<rect width="' + fmt(outW) + '" height="' + fmt(outH) + '" fill="' + fill + '"/>');
-        pathCount++;
-        continue;
-      }
-      if (layer.d) parts.push('<path fill="' + fill + '" fill-rule="evenodd" d="' + layer.d + '"/>');
-    }
-    parts.push('</svg>');
-    var svg = parts.join('\n');
+    var usedIds = {}, outLayers = [], usedColors = {}, usedPalette = [];
+    defs.forEach(function (def) {
+      var els = [], colors = [], seen = {}, count = 0;
+      def.items.forEach(function (it) {
+        var fill = hex(it.color);
+        if (it.rect) {
+          els.push('<rect width="' + fmt(outW) + '" height="' + fmt(outH) + '" fill="' + fill + '"/>');
+          pathCount++;
+          count++;
+        } else if (it.d) {
+          els.push('<path fill="' + fill + '" fill-rule="evenodd" d="' + it.d + '"/>');
+          count += it.count || (it.d.match(/M/g) || []).length;
+        } else return;
+        if (!seen[fill]) { seen[fill] = 1; colors.push(fill); }
+        if (!usedColors[fill]) { usedColors[fill] = 1; usedPalette.push(fill); }
+      });
+      if (!els.length) return;
+      var id = slug(def.name), base = id, dup = 2;
+      while (usedIds[id]) id = base + '-' + dup++;
+      usedIds[id] = 1;
+      outLayers.push({ id: id, name: def.name, colors: colors, count: count, body: els.join('\n') });
+    });
 
-    var usedPalette = [];
-    for (L = 0; L < layers.length; L++) usedPalette.push(hex(layers[L].color));
+    var open = '<svg xmlns="http://www.w3.org/2000/svg" xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape" width="' +
+               fmt(outW) + '" height="' + fmt(outH) + '" viewBox="0 0 ' + fmt(outW) + ' ' + fmt(outH) + '">';
+    var svg = buildSvg(open, outLayers);
 
     return {
       svg: svg,
+      open: open,
+      layers: outLayers,
       palette: usedPalette,
       stats: {
         width: w,
         height: h,
-        colors: layers.length,
+        colors: usedPalette.length,
+        layers: outLayers.length,
         paths: pathCount,
         segments: segCount,
         bytes: svg.length,
         ms: Math.round(now() - t0)
       }
     };
+  }
+
+  // ------------------------------------------------------------------
+  // Layers
+  // ------------------------------------------------------------------
+  var GROUPINGS = ['color', 'shape', 'size', 'similar'];
+
+  /** Join layers into one SVG document, each layer an Inkscape/Illustrator layer group. */
+  function buildSvg(open, layers) {
+    var parts = [open];
+    for (var i = 0; i < layers.length; i++) {
+      var l = layers[i];
+      parts.push('<g id="' + l.id + '" inkscape:label="' + escapeAttr(l.name) + '" inkscape:groupmode="layer">');
+      parts.push(l.body);
+      parts.push('</g>');
+    }
+    parts.push('</svg>');
+    return parts.join('\n');
+  }
+
+  function escapeAttr(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+  }
+  function slug(s) {
+    var r = String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    return /^[a-z]/.test(r) ? r : 'layer-' + (r || 'x');
+  }
+
+  /**
+   * Merge similar palette colors (closest OKLab centroids first) until at most
+   * maxGroups remain. Returns arrays of palette indices.
+   */
+  function groupColors(present, palette, counts, maxGroups) {
+    var lab = new Float64Array(3);
+    var cl = present.map(function (ix) {
+      var c = palette[ix];
+      toOklab(c[0], c[1], c[2], lab, 0);
+      return { ix: [ix], l: lab[0], a: lab[1], b: lab[2], wt: Math.max(1, counts[ix]) };
+    });
+    while (cl.length > maxGroups) {
+      var best = Infinity, bi = 0, bj = 1;
+      for (var i = 0; i < cl.length; i++) {
+        for (var j = i + 1; j < cl.length; j++) {
+          var dl = cl[i].l - cl[j].l, da = cl[i].a - cl[j].a, db = cl[i].b - cl[j].b;
+          var d = dl * dl + da * da + db * db;
+          if (d < best) { best = d; bi = i; bj = j; }
+        }
+      }
+      var A = cl[bi], B = cl[bj], wt = A.wt + B.wt;
+      A.l = (A.l * A.wt + B.l * B.wt) / wt;
+      A.a = (A.a * A.wt + B.a * B.wt) / wt;
+      A.b = (A.b * A.wt + B.b * B.wt) / wt;
+      A.wt = wt;
+      A.ix = A.ix.concat(B.ix);
+      cl.splice(bj, 1);
+    }
+    return cl.map(function (c) { return c.ix; });
+  }
+
+  // Attach each hole to the smallest outline that contains it. A hole's
+  // start pixel lies inside the hole, so its center is strictly inside the parent.
+  function assignHoles(outers, holes, w, h) {
+    var CELL = 64, gw = Math.ceil((w + 1) / CELL), gh = Math.ceil((h + 1) / CELL);
+    var grid = new Array(gw * gh);
+    for (var i = 0; i < outers.length; i++) {
+      var p = outers[i].outer;
+      var x0 = Math.floor(p.minX / CELL), x1 = Math.floor(p.maxX / CELL);
+      var y0 = Math.floor(p.minY / CELL), y1 = Math.floor(p.maxY / CELL);
+      for (var cy = y0; cy <= y1; cy++) {
+        for (var cx = x0; cx <= x1; cx++) {
+          var c = cy * gw + cx;
+          (grid[c] || (grid[c] = [])).push(i);
+        }
+      }
+    }
+    for (var hI = 0; hI < holes.length; hI++) {
+      var hp = holes[hI], qx = hp.sx + 0.5, qy = hp.sy + 0.5;
+      var cand = grid[Math.floor(qy / CELL) * gw + Math.floor(qx / CELL)] || [];
+      var best = -1, bestArea = Infinity;
+      for (var k = 0; k < cand.length; k++) {
+        var op = outers[cand[k]].outer;
+        if (op.area <= hp.area || op.area >= bestArea) continue;
+        if (qx < op.minX || qx > op.maxX || qy < op.minY || qy > op.maxY) continue;
+        if (pointInPolygon(op.pt, qx, qy)) { best = cand[k]; bestArea = op.area; }
+      }
+      if (best >= 0) outers[best].holes.push(hp);
+    }
+  }
+
+  function pointInPolygon(pts, x, y) {
+    var inside = false;
+    for (var i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      var a = pts[i], b = pts[j];
+      if ((a.y > y) !== (b.y > y) && x < (b.x - a.x) * (y - a.y) / (b.y - a.y) + a.x) inside = !inside;
+    }
+    return inside;
+  }
+
+  /**
+   * Classic shape descriptors of a pixel outline (no learning involved):
+   * area, elongation from second moments, fit to an ellipse with the same
+   * moments, fill of the minimum-area bounding rectangle, convexity, and
+   * mean stroke thickness. areaScale converts traced px² to output px².
+   */
+  function shapeFeatures(path, areaScale) {
+    var pts = path.pt, n = pts.length, x0 = pts[0].x, y0 = pts[0].y;
+    var A = 0, Cx = 0, Cy = 0, Sxx = 0, Syy = 0, Sxy = 0, i;
+    for (i = 0; i < n; i++) {
+      var a = pts[i], b = pts[(i + 1) % n];
+      var xi = a.x - x0, yi = a.y - y0, xj = b.x - x0, yj = b.y - y0;
+      var cr = xi * yj - xj * yi;
+      A += cr;
+      Cx += (xi + xj) * cr;
+      Cy += (yi + yj) * cr;
+      Sxx += (xi * xi + xi * xj + xj * xj) * cr;
+      Syy += (yi * yi + yi * yj + yj * yj) * cr;
+      Sxy += (xi * yj + 2 * xi * yi + 2 * xj * yj + xj * yi) * cr;
+    }
+    var sg = A < 0 ? -1 : 1;
+    A = Math.max(1e-9, sg * A / 2);
+    Cx = sg * Cx / (6 * A); Cy = sg * Cy / (6 * A);
+    var mu20 = sg * Sxx / 12 / A - Cx * Cx, mu02 = sg * Syy / 12 / A - Cy * Cy, mu11 = sg * Sxy / 24 / A - Cx * Cy;
+    var tr = (mu20 + mu02) / 2, disc = Math.sqrt((mu20 - mu02) * (mu20 - mu02) / 4 + mu11 * mu11);
+    var l1 = Math.max(1e-9, tr + disc), l2 = Math.max(1e-9, tr - disc);
+
+    var hull = convexHull(pts), hn = hull.length, hullArea = 0, rectArea = Infinity;
+    for (i = 0; i < hn; i++) {
+      var p = hull[i], q = hull[(i + 1) % hn];
+      hullArea += p.x * q.y - q.x * p.y;
+      var ex = q.x - p.x, ey = q.y - p.y, len = Math.hypot(ex, ey);
+      if (!len) continue;
+      ex /= len; ey /= len;
+      var umin = Infinity, umax = -Infinity, vmin = Infinity, vmax = -Infinity;
+      for (var j = 0; j < hn; j++) {
+        var u = hull[j].x * ex + hull[j].y * ey, v = -hull[j].x * ey + hull[j].y * ex;
+        if (u < umin) umin = u; if (u > umax) umax = u;
+        if (v < vmin) vmin = v; if (v > vmax) vmax = v;
+      }
+      var ra = (umax - umin) * (vmax - vmin);
+      if (ra < rectArea) rectArea = ra;
+    }
+    hullArea = Math.abs(hullArea) / 2;
+    return {
+      area: A * areaScale,
+      elong: Math.min(100, Math.sqrt(l1 / l2)),
+      ellipseFit: Math.min(1.2, A / (4 * Math.PI * Math.sqrt(l1 * l2))),
+      rectFit: rectArea > 0 && rectArea < Infinity ? Math.min(1, A / rectArea) : 1,
+      solidity: hullArea > 0 ? Math.min(1, A / hullArea) : 1,
+      thick: 2 * A / path.len * Math.sqrt(areaScale),
+      lengthRatio: path.len * path.len / (4 * A)
+    };
+  }
+
+  // Andrew's monotone chain.
+  function convexHull(pts) {
+    var s = pts.slice().sort(function (a, b) { return a.x - b.x || a.y - b.y; });
+    if (s.length < 3) return s;
+    function cross(o, a, b) { return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x); }
+    var lower = [], upper = [], i;
+    for (i = 0; i < s.length; i++) {
+      while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], s[i]) <= 0) lower.pop();
+      lower.push(s[i]);
+    }
+    for (i = s.length - 1; i >= 0; i--) {
+      while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], s[i]) <= 0) upper.pop();
+      upper.push(s[i]);
+    }
+    lower.pop(); upper.pop();
+    return lower.concat(upper);
+  }
+
+  var SHAPE_CLASSES = [
+    { key: 'complex', name: 'Complex shapes', word: 'complex' },
+    { key: 'rect', name: 'Rectangles & blocks', word: 'rectangular' },
+    { key: 'round', name: 'Round shapes', word: 'round' },
+    { key: 'triangle', name: 'Triangles & points', word: 'pointed' },
+    { key: 'thin', name: 'Lines & strokes', word: 'thin' }
+  ];
+  function shapeClass(f) {
+    if (f.elong > 6 || (f.thick < 4 && f.lengthRatio > 14)) return 4;
+    if (f.rectFit >= 0.85) return 1;
+    if (f.solidity >= 0.9 && f.ellipseFit >= 0.9) return 2;
+    if (f.solidity >= 0.85 && f.rectFit >= 0.38 && f.rectFit <= 0.64) return 3;
+    return 0;
+  }
+
+  var SIZE_CLASSES = [
+    { name: 'Large shapes', word: 'Large', min: 0.1 },
+    { name: 'Medium shapes', word: 'Medium', min: 0.01 },
+    { name: 'Small shapes', word: 'Small', min: 0.001 },
+    { name: 'Fine details', word: 'Tiny', min: 0 }
+  ];
+  function sizeClass(f, imageArea) {
+    var frac = f.area / imageArea;
+    for (var i = 0; i < SIZE_CLASSES.length; i++) if (frac >= SIZE_CLASSES[i].min) return i;
+    return SIZE_CLASSES.length - 1;
+  }
+
+  /** Sort objects into layers. Returns layer defs bottom to top. */
+  function groupObjects(objects, by, maxLayers, tracedArea, areaScale) {
+    var imageArea = tracedArea * areaScale;
+    var buckets = [], names = [], i;
+    if (by === 'shape') {
+      names = SHAPE_CLASSES.map(function (c) { return c.name; });
+      objects.forEach(function (ob) { ob.g = shapeClass(ob.f); });
+    } else if (by === 'size') {
+      // largest at the bottom
+      names = SIZE_CLASSES.map(function (c) { return c.name; });
+      objects.forEach(function (ob) { ob.g = sizeClass(ob.f, imageArea); });
+    } else {
+      var K = clusterObjects(objects, maxLayers);
+      // name each cluster after its typical size and shape, largest at the bottom
+      var info = [];
+      for (i = 0; i < K; i++) info.push({ i: i, logA: 0, n: 0, size: [0, 0, 0, 0], shape: [0, 0, 0, 0, 0] });
+      objects.forEach(function (ob) {
+        var c = info[ob.g];
+        c.n++;
+        c.logA += Math.log(ob.f.area + 1);
+        c.size[sizeClass(ob.f, imageArea)]++;
+        c.shape[shapeClass(ob.f)]++;
+      });
+      info = info.filter(function (c) { return c.n > 0; });
+      info.sort(function (a, b) { return b.logA / b.n - a.logA / a.n; });
+      var remap = [], used = {};
+      info.forEach(function (c, ni) {
+        remap[c.i] = ni;
+        var name = SIZE_CLASSES[argmax(c.size)].word + ' ' + SHAPE_CLASSES[argmax(c.shape)].word + ' shapes';
+        if (used[name]) name += ' ' + (++used[name]); else used[name] = 1;
+        names.push(name);
+      });
+      objects.forEach(function (ob) { ob.g = remap[ob.g]; });
+    }
+    for (i = 0; i < names.length; i++) buckets.push({ byColor: {}, list: [] });
+    objects.forEach(function (ob) {
+      var b = buckets[ob.g], key = hex(ob.color), e = b.byColor[key];
+      if (!e) { e = b.byColor[key] = { color: ob.color, ds: [], area: 0, count: 0 }; b.list.push(e); }
+      e.ds.push(ob.d);
+      e.area += ob.f.net;
+      e.count++;
+    });
+    var defs = [];
+    buckets.forEach(function (b, bi) {
+      if (!b.list.length) return;
+      b.list.sort(function (x, y) { return y.area - x.area; });
+      defs.push({
+        name: names[bi],
+        items: b.list.map(function (e) { return { color: e.color, d: e.ds.join(''), count: e.count }; })
+      });
+    });
+    return defs;
+  }
+
+  function argmax(arr) {
+    var b = 0;
+    for (var i = 1; i < arr.length; i++) if (arr[i] > arr[b]) b = i;
+    return b;
+  }
+
+  // k-means++ over size, shape and color descriptors. Sets ob.g, returns K.
+  function clusterObjects(objects, maxK) {
+    var D = 9, n = objects.length, K = Math.max(1, Math.min(maxK, n));
+    if (!n) return 0;
+    var X = new Float64Array(n * D), lab = new Float64Array(3), i, j, d;
+    for (i = 0; i < n; i++) {
+      var f = objects[i].f, c = objects[i].color, o = i * D;
+      toOklab(c[0], c[1], c[2], lab, 0);
+      X[o] = Math.log(f.area + 1) * 0.3;
+      X[o + 1] = Math.log(f.elong) * 0.6;
+      X[o + 2] = f.rectFit;
+      X[o + 3] = f.solidity;
+      X[o + 4] = Math.min(1, f.ellipseFit);
+      X[o + 5] = Math.min(f.holes, 4) / 4;
+      X[o + 6] = lab[0];
+      X[o + 7] = lab[1] * 2;
+      X[o + 8] = lab[2] * 2;
+    }
+    var rand = rng(7), C = new Float64Array(K * D), dist = new Float64Array(n);
+    function d2(i, k) {
+      var s = 0, a = i * D, b = k * D;
+      for (var t = 0; t < D; t++) { var e = X[a + t] - C[b + t]; s += e * e; }
+      return s;
+    }
+    var first = Math.floor(rand() * n);
+    for (j = 0; j < D; j++) C[j] = X[first * D + j];
+    for (i = 0; i < n; i++) dist[i] = d2(i, 0);
+    for (var k = 1; k < K; k++) {
+      var sum = 0;
+      for (i = 0; i < n; i++) sum += dist[i];
+      if (sum <= 0) { K = k; break; }
+      var r = rand() * sum, pick = n - 1;
+      for (i = 0; i < n; i++) { r -= dist[i]; if (r <= 0) { pick = i; break; } }
+      for (j = 0; j < D; j++) C[k * D + j] = X[pick * D + j];
+      for (i = 0; i < n; i++) { d = d2(i, k); if (d < dist[i]) dist[i] = d; }
+    }
+    var assign = new Int32Array(n), sums = new Float64Array(K * D), cnt = new Int32Array(K);
+    for (var it = 0; it < 30; it++) {
+      var changed = 0;
+      for (i = 0; i < n; i++) {
+        var best = 0, bd = Infinity;
+        for (k = 0; k < K; k++) { d = d2(i, k); if (d < bd) { bd = d; best = k; } }
+        if (assign[i] !== best || it === 0) { changed++; assign[i] = best; }
+      }
+      if (!changed && it > 0) break;
+      sums.fill(0); cnt.fill(0);
+      for (i = 0; i < n; i++) {
+        cnt[assign[i]]++;
+        for (j = 0; j < D; j++) sums[assign[i] * D + j] += X[i * D + j];
+      }
+      for (k = 0; k < K; k++) if (cnt[k]) for (j = 0; j < D; j++) C[k * D + j] = sums[k * D + j] / cnt[k];
+    }
+    for (i = 0; i < n; i++) objects[i].g = assign[i];
+    return K;
   }
 
   function now() {
@@ -1188,6 +1587,7 @@
     potrace: potrace,
     quantize: quantize,
     mergeSpeckles: mergeSpeckles,
+    buildSvg: buildSvg,
     DEFAULTS: DEFAULTS
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
