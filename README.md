@@ -1,5 +1,17 @@
 # Vectorious
 
+<!-- site-summary:start -->
+<!-- This section is this project's card on https://mendus59.github.io and is copied there daily.
+     Keep it true of what's on main: one plain-text summary line (max 160 characters), then 1-6 short bullets.
+     See CLAUDE.md ("Site summary"). -->
+Convert raster images (PNG, JPG, WebP, GIF, BMP) into detailed SVG vector graphics, entirely in the browser.
+
+- Traces each color layer with a built-in Potrace implementation into smooth Bezier curves, with no AI and nothing uploaded.
+- Presets for photos, logos, line art and pixel art, with up to 128 colors and optional pixel-exact edges.
+- Splits the result into layers by color, shape, size or similar objects, and downloads any layer as an SVG.
+- Compare, outline and zoom views check the vector against the original.
+<!-- site-summary:end -->
+
 Convert raster images (PNG, JPG, WebP, GIF, BMP) into detailed SVG vector graphics, entirely in the browser.
 
 - **No AI.** Conversion uses classic, deterministic algorithms only.
