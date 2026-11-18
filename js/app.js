@@ -4,14 +4,23 @@
 
   var MAX_WORK_PIXELS = 8e6; // cap on the traced bitmap size, keeps memory sane
 
+  var BASE = { pureColors: false, autoThreshold: false, resample: 'smooth', layering: 'stacked', order: 'lightness' };
   var PRESETS = {
-    max:          { mode: 'color', colors: 64, scale: 2, blur: 0, speckle: 2, alphamax: 1, opticurve: true, opttolerance: 0.1, pixelExact: false, layering: 'stacked', order: 'lightness' },
-    photo:        { mode: 'color', colors: 48, scale: 1, blur: 1, speckle: 12, alphamax: 1, opticurve: true, opttolerance: 0.2, pixelExact: false, layering: 'stacked', order: 'lightness' },
-    illustration: { mode: 'color', colors: 16, scale: 1, blur: 0, speckle: 4, alphamax: 1, opticurve: true, opttolerance: 0.2, pixelExact: false, layering: 'stacked', order: 'lightness' },
-    lineart:      { mode: 'bw', threshold: 128, invert: false, bwBackground: true, scale: 2, blur: 0, speckle: 8, alphamax: 1, opticurve: true, opttolerance: 0.2, pixelExact: false, layering: 'stacked', order: 'lightness' },
-    pixel:        { mode: 'color', colors: 64, scale: 1, blur: 0, speckle: 0, alphamax: 0, opticurve: false, opttolerance: 0.2, pixelExact: true, layering: 'stacked', order: 'lightness' }
+    max:          { mode: 'color', colors: 64, scale: 2, blur: 0, speckle: 2, alphamax: 1, opticurve: true, opttolerance: 0.1, pixelExact: false },
+    photo:        { mode: 'color', colors: 48, scale: 1, blur: 1, speckle: 12, alphamax: 1, opticurve: true, opttolerance: 0.2, pixelExact: false },
+    illustration: { mode: 'color', colors: 16, scale: 1, blur: 0, speckle: 4, alphamax: 1, opticurve: true, opttolerance: 0.2, pixelExact: false },
+    // Small, anti-aliased text and icons: a smooth 8x upscale gives the tracer
+    // sub-pixel edges, and pure colors drop the blended edge pixels.
+    smalltext:    { mode: 'color', colors: 8, pureColors: true, scale: 8, resample: 'smooth', blur: 0, speckle: 2, alphamax: 1, opticurve: true, opttolerance: 0.2, pixelExact: false },
+    lineart:      { mode: 'bw', threshold: 128, autoThreshold: true, invert: false, bwBackground: true, scale: 2, blur: 0, speckle: 8, alphamax: 1, opticurve: true, opttolerance: 0.2, pixelExact: false },
+    pixel:        { mode: 'color', colors: 64, scale: 1, blur: 0, speckle: 0, alphamax: 0, opticurve: false, opttolerance: 0.2, pixelExact: true },
+    pixelsmooth:  { mode: 'color', colors: 64, scale: 8, resample: 'scale2x', blur: 0, speckle: 0, alphamax: 0.6, opticurve: true, opttolerance: 0.2, pixelExact: false }
   };
-  var CONTROL_IDS = ['mode', 'colors', 'threshold', 'invert', 'bwBackground', 'scale', 'blur', 'speckle', 'pixelExact', 'alphamax', 'opticurve', 'opttolerance', 'layering', 'order', 'groupBy', 'maxLayers'];
+  Object.keys(PRESETS).forEach(function (k) {
+    Object.keys(BASE).forEach(function (b) { if (!(b in PRESETS[k])) PRESETS[k][b] = BASE[b]; });
+  });
+  var SMALL_IMAGE = 400; // longest side in px below which small-text tracing is suggested
+  var CONTROL_IDS = ['mode', 'colors', 'pureColors', 'threshold', 'autoThreshold', 'invert', 'bwBackground', 'scale', 'resample', 'blur', 'speckle', 'pixelExact', 'alphamax', 'opticurve', 'opttolerance', 'layering', 'order', 'groupBy', 'maxLayers'];
 
   var GROUP_HINTS = {
     color: 'One layer per color, with similar colors merged.',
@@ -34,8 +43,18 @@
     zoom: 1, tx: 0, ty: 0,
     jobId: 0, worker: null, workerOk: typeof Worker !== 'undefined',
     pending: null,
-    open: null, layers: [], hidden: {}
+    open: null, layers: [], hidden: {},
+    vw: 0, vh: 0,      // size of what the viewer shows (image, or text when there is no image)
+    work: 'trace',     // 'trace' | 'text'
+    traceResult: null, // last trace, restored when switching back from text
+    text: { fit: null, free: true }
   };
+
+  function setCanvasSize(w, h) {
+    state.vw = w; state.vh = h;
+    els.canvas.style.width = w + 'px';
+    els.canvas.style.height = h + 'px';
+  }
 
   // ------------------------------------------------------------------
   // Settings
@@ -44,10 +63,13 @@
     return {
       mode: $('mode').value,
       colors: +$('colors').value,
+      pureColors: $('pureColors').checked,
       threshold: +$('threshold').value,
+      autoThreshold: $('autoThreshold').checked,
       invert: $('invert').checked,
       bwBackground: $('bwBackground').checked,
       scale: +$('scale').value,
+      resample: $('resample').value,
       blur: +$('blur').value,
       speckle: +$('speckle').value,
       pixelExact: $('pixelExact').checked,
@@ -92,7 +114,9 @@
       (objectLayers ? ' Each shape is traced on its own (cutout), so layers never cover each other.'
         : $('layering').value === 'stacked' ? ' With Stacked layering a layer also fills in under the layers above it. Pick Cutout for layers that stand alone.' : '');
     $('opttolerance').closest('.field').classList.toggle('disabled-field', exact || !opt);
-    document.querySelectorAll('output[for]').forEach(function (out) {
+    $('threshold').closest('.field').classList.toggle('disabled-field', $('autoThreshold').checked);
+    $('resample').closest('.field').classList.toggle('disabled-field', exact || +$('scale').value <= 1);
+    document.querySelectorAll('[data-work="trace"] output[for]').forEach(function (out) {
       var input = $(out.getAttribute('for')), v = +input.value;
       if (input.id === 'scale') out.textContent = Math.round(v * 100) + '%';
       else if (input.id === 'blur') out.textContent = v ? v + ' px' : 'off';
@@ -155,18 +179,20 @@
     state.origUrl = url;
     state.name = name;
     state.hidden = {};
+    state.traceResult = null;
+    state.text.anchor = null;
     state.w = img.naturalWidth;
     state.h = img.naturalHeight;
     els.imgOriginal.src = url;
     els.imgVector.removeAttribute('src');
-    els.canvas.style.width = state.w + 'px';
-    els.canvas.style.height = state.h + 'px';
+    setCanvasSize(state.w, state.h);
     els.drop.hidden = true;
     els.canvas.hidden = false;
     els.trace.disabled = false;
     fit();
     updateView();
-    trace();
+    refreshMatchButtons();
+    if (state.work === 'text') renderText(); else trace();
   }
 
   function makeSample() {
@@ -204,34 +230,35 @@
   // ------------------------------------------------------------------
   // Tracing (in a Web Worker when possible)
   // ------------------------------------------------------------------
+  // Downscaling happens here on a canvas; upscaling is left to the engine,
+  // which has deterministic smooth, Scale2x and nearest-neighbour resamplers.
   function getPixels(opts) {
-    var scale = opts.scale;
-    var pw = Math.max(1, Math.round(state.w * scale)), ph = Math.max(1, Math.round(state.h * scale));
-    if (pw * ph > MAX_WORK_PIXELS) {
-      var f = Math.sqrt(MAX_WORK_PIXELS / (pw * ph));
-      pw = Math.max(1, Math.floor(pw * f));
-      ph = Math.max(1, Math.floor(ph * f));
-    }
+    var scale = Math.min(opts.scale, Math.sqrt(MAX_WORK_PIXELS / (state.w * state.h)));
+    var down = Math.min(1, scale);
+    var pw = Math.max(1, Math.round(state.w * down)), ph = Math.max(1, Math.round(state.h * down));
     var c = document.createElement('canvas');
     c.width = pw; c.height = ph;
     var g = c.getContext('2d', { willReadFrequently: true });
-    // Pixel-exact tracing needs hard pixel edges; everything else benefits from smooth resampling.
-    g.imageSmoothingEnabled = !(opts.pixelExact && pw >= state.w);
+    g.imageSmoothingEnabled = true;
     g.imageSmoothingQuality = 'high';
     g.drawImage(state.image, 0, 0, pw, ph);
-    return g.getImageData(0, 0, pw, ph);
+    var data = g.getImageData(0, 0, pw, ph);
+    return { data: data, upscale: scale > 1 ? scale : 1 };
   }
 
   function trace() {
-    if (!state.image) return;
+    if (!state.image || state.work !== 'trace') return;
     var opts = readOptions();
     var id = ++state.jobId;
-    var imgData;
-    try { imgData = getPixels(opts); } catch (err) { showError(err); return; }
+    var imgData, upscale;
+    try { var got = getPixels(opts); imgData = got.data; upscale = got.upscale; } catch (err) { showError(err); return; }
+    var traceScale = imgData.width * upscale / state.w; // traced pixels per original pixel
     var options = {
-      mode: opts.mode, colors: opts.colors, threshold: opts.threshold, invert: opts.invert, bwBackground: opts.bwBackground,
-      blur: Math.round(opts.blur * imgData.width / state.w), // blur radius is in original pixels
-      speckle: Math.round(opts.speckle * Math.pow(imgData.width / state.w, 2)),
+      mode: opts.mode, colors: opts.colors, pureColors: opts.pureColors,
+      threshold: opts.threshold, autoThreshold: opts.autoThreshold, invert: opts.invert, bwBackground: opts.bwBackground,
+      upscale: upscale, resample: opts.pixelExact ? 'nearest' : opts.resample,
+      blur: Math.round(opts.blur * traceScale), // blur radius is in original pixels
+      speckle: Math.round(opts.speckle * traceScale * traceScale),
       alphamax: opts.pixelExact ? 0 : opts.alphamax,
       opticurve: opts.opticurve, opttolerance: opts.opttolerance,
       pixelExact: opts.pixelExact, layering: opts.layering, order: opts.order,
@@ -239,6 +266,7 @@
       outWidth: state.w, outHeight: state.h
     };
     if (opts.blur > 0 && options.blur < 1) options.blur = 1;
+    if (opts.speckle > 1 && options.speckle < 2) options.speckle = 2;
     showBusy('Preparing', 0);
     var started = performance.now();
 
@@ -279,6 +307,12 @@
 
   function onResult(m, imgData, elapsed) {
     hideBusy();
+    state.traceResult = { m: m, elapsed: elapsed };
+    if (state.work !== 'trace') return;
+    showTraceResult(m, elapsed);
+  }
+
+  function showTraceResult(m, elapsed) {
     state.open = m.open;
     state.layers = m.layers;
     renderLayers();
@@ -290,7 +324,12 @@
       ' · <b>' + s.colors + '</b> colors · <b>' + s.layers + '</b> layers · <b>' + s.paths.toLocaleString() + '</b> shapes' +
       (s.segments ? ' · ' + s.segments.toLocaleString() + ' segments' : '') +
       ' · <b>' + formatBytes(s.bytes) + '</b> in all · ' + (elapsed / 1000).toFixed(2) + ' s' +
-      (s.bytes > 25e6 ? ' · <b>Very large file.</b> For photos try the Photo preset, Denoise, or a higher Speckle filter.' : '');
+      (s.threshold != null && $('autoThreshold').checked ? ' · auto threshold ' + s.threshold : '') +
+      (s.bytes > 25e6 ? ' · <b>Very large file.</b> For photos try the Photo preset, Denoise, or a higher Speckle filter.' : '') +
+      (Math.max(state.w, state.h) <= SMALL_IMAGE && +$('scale').value < 4 && !$('pixelExact').checked
+        ? ' · Small image: <button type="button" class="linkbtn" id="useSmallText">try the Small text / icon preset</button>' : '');
+    var tip = $('useSmallText');
+    if (tip) tip.onclick = function () { $('preset').value = 'smalltext'; applyPreset('smalltext'); saveSettings(); trace(); };
     els.palette.innerHTML = '';
     m.palette.slice(0, 128).forEach(function (hex) {
       var i = document.createElement('i');
@@ -380,7 +419,7 @@
     dl.setAttribute('aria-label', 'Download ' + layer.name);
     dl.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0l-4-4m4 4l4-4M5 19h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
     dl.addEventListener('click', function () {
-      saveSvg(window.Vectorious.buildSvg(state.open, [layer]), state.name + '-' + layer.id + '.svg');
+      saveSvg(window.Vectorious.buildSvg(state.open, [layer]), outName() + '-' + layer.id + '.svg');
     });
     li.appendChild(box);
     li.appendChild(sw);
@@ -403,7 +442,13 @@
   function downloadVisible() {
     if (!state.svg) return;
     var all = visibleLayers().length === state.layers.length;
-    saveSvg(state.svg, state.name + (all ? '' : '-layers') + '.svg');
+    saveSvg(state.svg, outName() + (all ? '' : '-layers') + '.svg');
+  }
+
+  function outName() {
+    if (state.work !== 'text') return state.name;
+    var words = $('textInput').value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
+    return words || 'text';
   }
 
   function outlineSvg(svg) {
@@ -443,16 +488,16 @@
   // ------------------------------------------------------------------
   function fit() {
     var r = els.stage.getBoundingClientRect();
-    if (!state.w || !r.width) return;
-    var z = Math.min((r.width - 32) / state.w, (r.height - 32) / state.h);
+    if (!state.vw || !r.width) return;
+    var z = Math.min((r.width - 32) / state.vw, (r.height - 32) / state.vh);
     setZoom(Math.max(0.02, z), r.width / 2, r.height / 2, true);
   }
   function setZoom(z, cx, cy, center) {
     z = Math.min(64, Math.max(0.02, z));
     var r = els.stage.getBoundingClientRect();
     if (center) {
-      state.tx = (r.width - state.w * z) / 2;
-      state.ty = (r.height - state.h * z) / 2;
+      state.tx = (r.width - state.vw * z) / 2;
+      state.ty = (r.height - state.vh * z) / 2;
     } else {
       // keep the point under (cx, cy) fixed
       state.tx = cx - (cx - state.tx) * (z / state.zoom);
@@ -467,9 +512,11 @@
     els.canvas.classList.toggle('pixelated', state.zoom > 2);
     els.zoomLabel.textContent = Math.round(state.zoom * 100) + '%';
     var v = state.view, r = els.stage.getBoundingClientRect();
-    els.imgOriginal.hidden = !(v === 'split' || v === 'original');
+    var orig = !!state.image && !(state.work === 'text' && state.text.free);
+    if (!orig && (v === 'split' || v === 'original')) v = 'svg';
+    els.imgOriginal.hidden = !orig || !(v === 'split' || v === 'original');
     els.imgVector.hidden = v === 'original';
-    els.divider.hidden = v !== 'split' || !state.image;
+    els.divider.hidden = v !== 'split';
     if (v === 'split') {
       var sxScreen = r.width * state.split;
       var local = (sxScreen - state.tx) / state.zoom; // divider position in image pixels
@@ -490,7 +537,7 @@
   // Pointer handling: drag divider, or pan.
   var drag = null;
   els.stage.addEventListener('pointerdown', function (e) {
-    if (!state.image || e.button > 0) return;
+    if (els.canvas.hidden || e.button > 0) return;
     var r = els.stage.getBoundingClientRect();
     var onDivider = state.view === 'split' && Math.abs(e.clientX - r.left - r.width * state.split) < 14;
     drag = { mode: onDivider ? 'split' : 'pan', x: e.clientX, y: e.clientY, tx: state.tx, ty: state.ty };
@@ -512,13 +559,13 @@
   els.stage.addEventListener('pointerup', endDrag);
   els.stage.addEventListener('pointercancel', endDrag);
   els.stage.addEventListener('wheel', function (e) {
-    if (!state.image) return;
+    if (els.canvas.hidden) return;
     e.preventDefault();
     var r = els.stage.getBoundingClientRect();
     var factor = Math.exp(-e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0018));
     setZoom(state.zoom * factor, e.clientX - r.left, e.clientY - r.top);
   }, { passive: false });
-  els.stage.addEventListener('dblclick', function () { if (state.image) fit(); });
+  els.stage.addEventListener('dblclick', function () { if (!els.canvas.hidden) fit(); });
 
   function zoomBy(f) {
     var r = els.stage.getBoundingClientRect();
@@ -529,6 +576,389 @@
   els.zoomFit.onclick = fit;
   els.zoom1.onclick = function () { var r = els.stage.getBoundingClientRect(); setZoom(1, r.width / 2, r.height / 2); };
   window.addEventListener('resize', function () { updateView(); });
+
+  // ------------------------------------------------------------------
+  // Text to vector: typed text + a font -> SVG outlines
+  // ------------------------------------------------------------------
+  // Bundled fonts (fonts/, OFL or Apache licensed, subset to Latin-1).
+  var FONT_GROUPS = [
+    ['Sans serif', [['Lato', 'Lato-Regular'], ['Lato Bold', 'Lato-Bold'], ['Bebas Neue', 'BebasNeue-Regular'], ['Anton', 'Anton-Regular']]],
+    ['Serif', [['DM Serif Display', 'DMSerifDisplay-Regular'], ['Abril Fatface', 'AbrilFatface-Regular'], ['Arvo', 'Arvo-Regular']]],
+    ['Script', [['Pacifico', 'Pacifico-Regular'], ['Lobster', 'Lobster-Regular'], ['Great Vibes', 'GreatVibes-Regular']]],
+    ['Handwriting', [['Patrick Hand', 'PatrickHand-Regular'], ['Indie Flower', 'IndieFlower-Regular'], ['Gochi Hand', 'GochiHand-Regular'],
+      ['Schoolbell', 'Schoolbell-Regular'], ['Short Stack', 'ShortStack-Regular']]],
+    ['Playful', [['Mouse Memoirs', 'MouseMemoirs-Regular'], ['Sniglet', 'Sniglet-Regular'], ['Luckiest Guy', 'LuckiestGuy-Regular'],
+      ['Bangers', 'Bangers-Regular'], ['Henny Penny', 'HennyPenny-Regular'], ['Mystery Quest', 'MysteryQuest-Regular']]],
+    ['Pixel and mono', [['Press Start 2P', 'PressStart2P-Regular'], ['Silkscreen', 'Silkscreen-Regular'], ['VT323', 'VT323-Regular'], ['Space Mono', 'SpaceMono-Regular']]],
+    ['Blackletter', [['UnifrakturMaguntia', 'UnifrakturMaguntia-Book']]]
+  ];
+  var FONTS = [];          // [{ id, name, file?, font? }]
+  var TEXT_IDS = ['textInput', 'font', 'textSize', 'letterSpacing', 'scaleX', 'lineHeight', 'textAlign', 'smallCaps', 'textFill', 'textBgOn', 'textBg', 'textCrop'];
+  var opentypeReady = null;
+
+  FONT_GROUPS.forEach(function (g) {
+    g[1].forEach(function (f) { FONTS.push({ id: f[1], name: f[0], file: 'fonts/' + f[1] + '.woff', group: g[0] }); });
+  });
+
+  function fontById(id) { return FONTS.filter(function (f) { return f.id === id; })[0]; }
+
+  function buildFontSelect() {
+    var sel = $('font'), keep = sel.value;
+    sel.innerHTML = '';
+    var groups = FONT_GROUPS.map(function (g) { return g[0]; });
+    if (FONTS.some(function (f) { return f.group === 'Your fonts'; })) groups.unshift('Your fonts');
+    groups.forEach(function (name) {
+      var og = document.createElement('optgroup');
+      og.label = name;
+      FONTS.forEach(function (f) {
+        if (f.group !== name) return;
+        var op = document.createElement('option');
+        op.value = f.id; op.textContent = f.name;
+        og.appendChild(op);
+      });
+      sel.appendChild(og);
+    });
+    sel.value = keep && fontById(keep) ? keep : 'ShortStack-Regular';
+  }
+
+  function loadOpentype() {
+    if (window.opentype) return Promise.resolve();
+    if (!opentypeReady) {
+      opentypeReady = new Promise(function (resolve, reject) {
+        var sc = document.createElement('script');
+        sc.src = 'js/vendor/opentype.min.js';
+        sc.onload = function () { resolve(); };
+        sc.onerror = function () { opentypeReady = null; reject(new Error('Could not load the font reader.')); };
+        document.head.appendChild(sc);
+      });
+    }
+    return opentypeReady;
+  }
+
+  function loadFont(entry) {
+    if (entry.font) return Promise.resolve(entry.font);
+    if (entry.loading) return entry.loading;
+    entry.loading = loadOpentype().then(function () {
+      if (entry.local) return entry.local.blob().then(function (b) { return b.arrayBuffer(); });
+      return fetch(entry.file).then(function (r) {
+        if (!r.ok) throw new Error('Could not load ' + entry.name + ' (' + r.status + ').');
+        return r.arrayBuffer();
+      });
+    }).then(function (buf) {
+      entry.font = window.opentype.parse(buf);
+      return entry.font;
+    }).catch(function (err) {
+      entry.loading = null;
+      throw err;
+    });
+    return entry.loading;
+  }
+
+  function addUserFont(buf, fallbackName) {
+    return loadOpentype().then(function () {
+      var font = window.opentype.parse(buf);
+      var names = font.names || {}, fam = (names.fullName || names.fontFamily || {}).en || fallbackName || 'Custom font';
+      var id = 'user-' + fam.replace(/[^a-z0-9]+/gi, '-').toLowerCase();
+      var entry = fontById(id);
+      if (!entry) { entry = { id: id, name: fam, group: 'Your fonts' }; FONTS.unshift(entry); }
+      entry.font = font;
+      buildFontSelect();
+      $('font').value = id;
+      return entry;
+    });
+  }
+
+  function readTextOptions() {
+    return {
+      text: $('textInput').value,
+      font: $('font').value,
+      size: +$('textSize').value,
+      letterSpacing: +$('letterSpacing').value,
+      scaleX: +$('scaleX').value,
+      lineHeight: +$('lineHeight').value,
+      align: $('textAlign').value,
+      smallCaps: $('smallCaps').checked,
+      fill: $('textFill').value,
+      background: $('textBgOn').checked ? $('textBg').value : null,
+      crop: $('textCrop').checked
+    };
+  }
+
+  function saveTextSettings() {
+    try {
+      var t = readTextOptions();
+      delete t.font;
+      t.font = fontById($('font').value) && fontById($('font').value).file ? $('font').value : null;
+      localStorage.setItem('vectorious.text', JSON.stringify(t));
+    } catch (_) { /* storage unavailable */ }
+  }
+  function loadTextSettings() {
+    try {
+      var t = JSON.parse(localStorage.getItem('vectorious.text') || 'null');
+      if (!t) return;
+      var map = { text: 'textInput', font: 'font', size: 'textSize', letterSpacing: 'letterSpacing', scaleX: 'scaleX',
+        lineHeight: 'lineHeight', align: 'textAlign', smallCaps: 'smallCaps', fill: 'textFill', crop: 'textCrop' };
+      Object.keys(map).forEach(function (k) {
+        var el = $(map[k]);
+        if (t[k] == null || !el) return;
+        if (el.type === 'checkbox') el.checked = !!t[k]; else el.value = t[k];
+      });
+      $('textBgOn').checked = !!t.background;
+      if (t.background) $('textBg').value = t.background;
+    } catch (_) { /* ignore */ }
+  }
+
+  function refreshTextControls() {
+    document.querySelectorAll('#panel output[for]').forEach(function (out) {
+      var id = out.getAttribute('for'), v = +$(id).value;
+      if (id === 'textSize') out.textContent = v + ' px';
+      else if (id === 'letterSpacing') out.textContent = (v >= 0 ? '+' : '') + v.toFixed(3) + ' em';
+      else if (id === 'scaleX') out.textContent = Math.round(v * 100) + '%';
+      else if (id === 'lineHeight') out.textContent = v.toFixed(2);
+    });
+  }
+
+  function refreshMatchButtons() {
+    var has = !!state.image;
+    $('fitText').disabled = !has;
+    $('findFont').disabled = !has;
+    $('textCrop').closest('.check').hidden = !has;
+    $('matchNote').textContent = has
+      ? 'Type the words in the image above, then fit them. Matching compares letter shapes with the image; it is not AI.'
+      : 'Open an image of text, type its words above, then let Vectorious fit them. Matching compares letter shapes; it is not AI.';
+  }
+
+  var textTimer = 0, textJob = 0;
+  function scheduleText(delay) {
+    clearTimeout(textTimer);
+    textTimer = setTimeout(renderText, delay || 0);
+  }
+
+  function renderText() {
+    if (state.work !== 'text') return;
+    var t = readTextOptions(), entry = fontById(t.font), job = ++textJob;
+    if (!entry) return;
+    showBusy('Loading ' + entry.name, 0.3);
+    loadFont(entry).then(function (font) {
+      if (job !== textJob) return;
+      hideBusy();
+      var onImage = !!state.image && !t.crop;
+      state.text.free = !onImage;
+      var o = {
+        size: t.size, letterSpacing: t.letterSpacing, scaleX: t.scaleX, lineHeight: t.lineHeight,
+        align: t.align, smallCaps: t.smallCaps, fill: t.fill, background: t.background
+      };
+      if (onImage) {
+        // Keep the text centred on its anchor: the fitted position, else the image centre.
+        o.width = state.w; o.height = state.h;
+        var a = state.text.anchor || { x: state.w / 2, y: state.h / 2 };
+        var b = window.VectoriousText.layout(font, t.text, o).bbox;
+        o.x = b ? a.x - (b.x1 + b.x2) / 2 : 0;
+        o.y = b ? a.y - (b.y1 + b.y2) / 2 : 0;
+      }
+      var r = window.VectoriousText.textLayers(font, t.text, o);
+      state.open = r.open;
+      state.layers = r.layers;
+      if (state.vw !== r.width || state.vh !== r.height || els.canvas.hidden) {
+        setCanvasSize(r.width, r.height);
+        els.drop.hidden = true;
+        els.canvas.hidden = false;
+        fit();
+      }
+      renderLayers();
+      rebuildVisible();
+      updateView();
+      els.stats.innerHTML = '<b>' + escapeHtml(entry.name) + '</b> · <b>' + r.glyphs + '</b> letters · ' + r.width + '×' + r.height +
+        ' · <b>' + formatBytes(state.svg.length) + '</b>' + (onImage ? ' · drawn on the image canvas' : '');
+      els.palette.innerHTML = '';
+    }).catch(function (err) {
+      if (job !== textJob) return;
+      showError(err);
+      if (location.protocol === 'file:') els.stats.textContent += ' Fonts need the page served over http (see README).';
+    });
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; });
+  }
+
+  // Image pixels for matching, at most ~320 px wide (matching is O(pixels)).
+  function matchPixels() {
+    var k = Math.min(1, 320 / state.w, 160 / state.h);
+    var w = Math.max(1, Math.round(state.w * k)), h = Math.max(1, Math.round(state.h * k));
+    var c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    var g = c.getContext('2d', { willReadFrequently: true });
+    g.imageSmoothingEnabled = true;
+    g.imageSmoothingQuality = 'high';
+    g.drawImage(state.image, 0, 0, w, h);
+    return { img: g.getImageData(0, 0, w, h), k: k };
+  }
+
+  function applyFit(fontId, fitted, ink, k) {
+    var o = window.VectoriousText.scaleOptions(fitted, 1 / k);
+    $('font').value = fontId;
+    $('textSize').value = Math.round(o.size * 2) / 2;
+    $('letterSpacing').value = Math.round(o.letterSpacing * 1000) / 1000;
+    $('scaleX').value = Math.round(o.scaleX * 100) / 100;
+    $('smallCaps').checked = !!o.smallCaps;
+    $('textCrop').checked = false;
+    var b = window.VectoriousText.layout(fontById(fontId).font, $('textInput').value, o).bbox;
+    if (b) state.text.anchor = { x: (b.x1 + b.x2) / 2 + o.x, y: (b.y1 + b.y2) / 2 + o.y };
+    if (ink) {
+      $('textFill').value = window.VectoriousText.hex(ink.ink);
+      $('textBgOn').checked = !!ink.background;
+      if (ink.background) $('textBg').value = window.VectoriousText.hex(ink.background);
+    }
+    refreshTextControls();
+    saveTextSettings();
+    renderText();
+  }
+
+  function needWords() {
+    if (/\S/.test($('textInput').value)) return false;
+    els.stats.textContent = 'Type the words that are in the image first.';
+    $('textInput').focus();
+    return true;
+  }
+
+  function fitCurrentFont() {
+    if (!state.image || needWords()) return;
+    var entry = fontById($('font').value), text = $('textInput').value;
+    showBusy('Fitting ' + entry.name, 0.2);
+    loadFont(entry).then(function (font) {
+      setTimeout(function () {
+        var mp = matchPixels(), ink = window.VectoriousText.inkOf(mp.img);
+        var r = window.VectoriousText.matchFont(font, text, ink, textBase());
+        hideBusy();
+        if (!r) { els.stats.textContent = 'No text found in the image to fit to.'; return; }
+        applyFit(entry.id, r.options, ink, mp.k);
+        els.stats.innerHTML += ' · overlap with the image <b>' + Math.round(r.score * 100) + '%</b>';
+      }, 20);
+    }).catch(showError);
+  }
+
+  function textBase() {
+    return { lineHeight: +$('lineHeight').value, align: $('textAlign').value };
+  }
+
+  function findClosestFont() {
+    if (!state.image || needWords()) return;
+    // bundled fonts plus uploaded ones (installed fonts can number in the hundreds)
+    var text = $('textInput').value, results = [], i = 0;
+    var list = FONTS.filter(function (f) { return f.file || (f.font && !f.local); });
+    var mp = matchPixels(), ink = window.VectoriousText.inkOf(mp.img);
+    if (!ink.box) { els.stats.textContent = 'No text found in the image to match.'; return; }
+    var job = ++textJob;
+    $('fontResults').innerHTML = '';
+    (function step() {
+      if (job !== textJob) return;
+      if (i >= list.length) return done();
+      var entry = list[i++];
+      showBusy('Comparing ' + entry.name, i / list.length);
+      loadFont(entry).then(function (font) {
+        setTimeout(function () {
+          var r = window.VectoriousText.matchFont(font, text, ink, textBase());
+          if (r) results.push({ entry: entry, score: r.score, options: r.options });
+          step();
+        }, 0);
+      }).catch(function () { step(); });
+    })();
+    function done() {
+      hideBusy();
+      results.sort(function (a, b) { return b.score - a.score; });
+      var top = results.slice(0, 6), ol = $('fontResults');
+      top.forEach(function (r, ri) {
+        var li = document.createElement('li'), b = document.createElement('button');
+        b.type = 'button';
+        b.innerHTML = '<span>' + escapeHtml(r.entry.name) + (r.options.smallCaps ? ' <small>small caps</small>' : '') + '</span><small>' +
+          Math.round(r.score * 100) + '% match</small>';
+        b.onclick = function () {
+          ol.querySelectorAll('li').forEach(function (x) { x.classList.remove('on'); });
+          li.classList.add('on');
+          applyFit(r.entry.id, r.options, ink, mp.k);
+        };
+        li.appendChild(b);
+        ol.appendChild(li);
+        if (ri === 0) { li.classList.add('on'); applyFit(r.entry.id, r.options, ink, mp.k); }
+      });
+      if (!top.length) els.stats.textContent = 'No font could be fitted to the image.';
+    }
+  }
+
+  function setWork(work) {
+    state.work = work;
+    document.querySelectorAll('[data-work-tab]').forEach(function (b) { b.classList.toggle('on', b.getAttribute('data-work-tab') === work); });
+    document.querySelectorAll('[data-work]').forEach(function (el) { el.hidden = el.getAttribute('data-work') !== work; });
+    try { localStorage.setItem('vectorious.work', work); } catch (_) { /* ignore */ }
+    state.hidden = {};
+    if (work === 'text') {
+      textJob++;
+      renderText();
+    } else {
+      textJob++;
+      hideBusy();
+      if (!state.image) {
+        els.canvas.hidden = true; els.drop.hidden = false;
+        state.layers = []; renderLayers(); state.svg = null; setVectorSrc();
+        els.stats.textContent = 'Open an image to begin.';
+        els.download.disabled = els.copy.disabled = els.downloadVisible.disabled = true;
+        return;
+      }
+      setCanvasSize(state.w, state.h);
+      fit();
+      if (state.traceResult) showTraceResult(state.traceResult.m, state.traceResult.elapsed);
+      else trace();
+    }
+  }
+
+  function initText() {
+    buildFontSelect();
+    loadTextSettings();
+    if (!fontById($('font').value)) $('font').value = 'ShortStack-Regular';
+    refreshTextControls();
+    refreshMatchButtons();
+    if (window.queryLocalFonts) $('localFonts').hidden = false;
+    TEXT_IDS.forEach(function (id) {
+      var el = $(id);
+      var ev = el.type === 'range' || el.tagName === 'TEXTAREA' || el.type === 'color' ? 'input' : 'change';
+      el.addEventListener(ev, function () {
+        refreshTextControls();
+        saveTextSettings();
+        scheduleText(ev === 'input' ? 120 : 0);
+      });
+    });
+    $('font').addEventListener('change', function () { $('fontResults').querySelectorAll('li').forEach(function (x) { x.classList.remove('on'); }); });
+    $('fontFile').addEventListener('change', function () {
+      var f = $('fontFile').files[0];
+      $('fontFile').value = '';
+      if (!f) return;
+      f.arrayBuffer().then(function (buf) { return addUserFont(buf, f.name.replace(/\.[^.]+$/, '')); })
+        .then(function () { renderText(); })
+        .catch(function (err) { showError('That font could not be read: ' + (err && err.message || err)); });
+    });
+    $('localFonts').addEventListener('click', function () {
+      window.queryLocalFonts().then(function (fonts) {
+        if (!fonts.length) { els.stats.textContent = 'No installed fonts were shared.'; return; }
+        var added = 0;
+        fonts.slice(0, 400).forEach(function (fd) {
+          if (fontById('local-' + fd.postscriptName)) return;
+          FONTS.unshift({ id: 'local-' + fd.postscriptName, name: fd.fullName, group: 'Your fonts', local: fd });
+          added++;
+        });
+        buildFontSelect();
+        els.stats.textContent = added + ' installed fonts added to the font list under "Your fonts".';
+      }).catch(function (err) { showError(err); });
+    });
+    $('fitText').onclick = fitCurrentFont;
+    $('findFont').onclick = findClosestFont;
+    document.querySelectorAll('[data-work-tab]').forEach(function (b) {
+      b.onclick = function () { setWork(b.getAttribute('data-work-tab')); };
+    });
+    var saved = null;
+    try { saved = localStorage.getItem('vectorious.work'); } catch (_) { /* ignore */ }
+    if (saved === 'text') setWork('text');
+  }
 
   // ------------------------------------------------------------------
   // Wiring
@@ -586,4 +1016,5 @@
 
   if (!loadSettings()) applyPreset('illustration');
   refreshControls();
+  initText();
 })();

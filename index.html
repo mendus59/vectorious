@@ -25,20 +25,84 @@
   <main class="layout">
     <aside class="panel" id="panel">
       <section class="group">
+        <div class="seg work-seg" role="tablist" aria-label="What to make">
+          <button type="button" data-work-tab="trace" class="on">Trace an image</button>
+          <button type="button" data-work-tab="text">Text to vector</button>
+        </div>
+      </section>
+
+      <section class="group" data-work="text" hidden>
+        <h2>Text</h2>
+        <label class="field">
+          <span>Words</span>
+          <textarea id="textInput" rows="3" spellcheck="false">Have a magical day!</textarea>
+          <small>New lines start new lines of text.</small>
+        </label>
+        <label class="field">
+          <span>Font</span>
+          <select id="font"></select>
+        </label>
+        <div class="row-btns">
+          <label class="btn small" for="fontFile">Upload a font…</label>
+          <button type="button" class="btn small" id="localFonts" hidden>Installed fonts…</button>
+        </div>
+        <small class="muted field-note">TTF, OTF or WOFF. Fonts stay on this device.</small>
+        <label class="field range">
+          <span>Size <output for="textSize"></output></span>
+          <input type="range" id="textSize" min="6" max="400" step="0.5" value="72">
+        </label>
+        <label class="field range">
+          <span>Letter spacing <output for="letterSpacing"></output></span>
+          <input type="range" id="letterSpacing" min="-0.1" max="0.6" step="0.005" value="0">
+        </label>
+        <label class="field range">
+          <span>Width <output for="scaleX"></output></span>
+          <input type="range" id="scaleX" min="0.5" max="2" step="0.01" value="1">
+        </label>
+        <label class="field range">
+          <span>Line height <output for="lineHeight"></output></span>
+          <input type="range" id="lineHeight" min="0.6" max="3" step="0.05" value="1.2">
+        </label>
+        <label class="field">
+          <span>Align</span>
+          <select id="textAlign">
+            <option value="left">Left</option>
+            <option value="center">Center</option>
+            <option value="right">Right</option>
+          </select>
+        </label>
+        <label class="check"><input type="checkbox" id="smallCaps"> Small caps (lowercase as small capitals)</label>
+        <div class="color-row">
+          <label>Fill <input type="color" id="textFill" value="#1f2937"></label>
+          <label class="check inline"><input type="checkbox" id="textBgOn"> Background <input type="color" id="textBg" value="#ffffff"></label>
+        </div>
+      </section>
+
+      <section class="group" data-work="text" hidden>
+        <h2>Match the image</h2>
+        <p class="muted note" id="matchNote">Open an image of text, type its words above, then let Vectorious fit them. Matching compares shapes; it is not AI.</p>
+        <button type="button" class="btn wide" id="fitText" disabled>Fit this font to the image</button>
+        <button type="button" class="btn primary wide" id="findFont" disabled>Find the closest font</button>
+        <ol class="font-results" id="fontResults"></ol>
+        <label class="check" hidden><input type="checkbox" id="textCrop"> Size the SVG to the text, not the image</label>
+      </section>
+      <section class="group" data-work="trace">
         <label class="field">
           <span>Preset</span>
           <select id="preset">
             <option value="max">Maximum detail</option>
             <option value="photo">Photo</option>
             <option value="illustration" selected>Illustration / logo</option>
+            <option value="smalltext">Small text / icon</option>
             <option value="lineart">Line art (black &amp; white)</option>
             <option value="pixel">Pixel art (exact)</option>
+            <option value="pixelsmooth">Pixel art (smoothed)</option>
             <option value="custom">Custom</option>
           </select>
         </label>
       </section>
 
-      <section class="group">
+      <section class="group" data-work="trace">
         <h2>Color</h2>
         <label class="field">
           <span>Mode</span>
@@ -53,21 +117,31 @@
           <input type="range" id="colors" min="2" max="128" step="1" value="16">
           <small>More colors keep more tonal detail.</small>
         </label>
+        <label class="check" data-show="color gray"><input type="checkbox" id="pureColors"> Pure colors (drop anti-aliasing blends)</label>
         <label class="field range" data-show="bw">
           <span>Threshold <output for="threshold"></output></span>
           <input type="range" id="threshold" min="1" max="254" step="1" value="128">
           <small>Pixels darker than this become black, the rest white.</small>
         </label>
+        <label class="check" data-show="bw"><input type="checkbox" id="autoThreshold"> Auto threshold (halfway between ink and background)</label>
         <label class="check" data-show="bw"><input type="checkbox" id="bwBackground" checked> Solid background (no transparency)</label>
         <label class="check" data-show="bw"><input type="checkbox" id="invert"> Swap black and white</label>
       </section>
 
-      <section class="group">
+      <section class="group" data-work="trace">
         <h2>Detail</h2>
         <label class="field range">
           <span>Resolution <output for="scale"></output></span>
-          <input type="range" id="scale" min="0.25" max="4" step="0.25" value="1">
-          <small>Upscale small images for finer curves. Slower at high values.</small>
+          <input type="range" id="scale" min="0.25" max="8" step="0.25" value="1">
+          <small>Upscale small images for finer curves. Small text needs 400–800%.</small>
+        </label>
+        <label class="field">
+          <span>Upscale method</span>
+          <select id="resample">
+            <option value="smooth">Smooth (bicubic, for anti-aliased art)</option>
+            <option value="scale2x">Pixel art (Scale2x, rounds diagonals)</option>
+            <option value="nearest">Hard pixels (nearest neighbour)</option>
+          </select>
         </label>
         <label class="field range">
           <span>Denoise <output for="blur"></output></span>
@@ -81,7 +155,7 @@
         </label>
       </section>
 
-      <section class="group">
+      <section class="group" data-work="trace">
         <h2>Curves</h2>
         <label class="check"><input type="checkbox" id="pixelExact"> Pixel-exact edges (no curve fitting)</label>
         <label class="field range" data-curves>
@@ -97,7 +171,7 @@
         </label>
       </section>
 
-      <section class="group">
+      <section class="group" data-work="trace">
         <h2>Output</h2>
         <label class="field">
           <span>Layering</span>
@@ -162,7 +236,7 @@
     </section>
 
     <aside class="panel layers-panel" id="layersPanel" aria-label="Layers">
-      <section class="group">
+      <section class="group" data-work="trace">
         <h2>Layers</h2>
         <label class="field">
           <span>Group by</span>
@@ -196,7 +270,9 @@
   </main>
 
   <input type="file" id="file" accept="image/*" hidden>
+  <input type="file" id="fontFile" accept=".ttf,.otf,.woff,font/ttf,font/otf,font/woff" hidden>
   <script src="js/tracer.js"></script>
+  <script src="js/text.js"></script>
   <script src="js/app.js"></script>
 </body>
 </html>
