@@ -174,4 +174,62 @@ test('larger noisy image completes in reasonable time', () => {
   console.log('     400x300, 32 colors:', r.stats.ms + 'ms,', r.stats.paths, 'paths,', (r.stats.bytes / 1024).toFixed(0) + 'KB');
 });
 
+
+// ---- small text: upscaling, pure colors, auto threshold
+const INK = [31, 78, 121];
+function mix(t) { return INK.map((c, i) => Math.round(c * t + 255 * (1 - t))); }
+// A 2px-wide anti-aliased ring and bar, like small rendered text.
+const smallText = makeImage(40, 20, (x, y) => {
+  const d = Math.abs(Math.hypot(x + 0.5 - 10, y + 0.5 - 10) - 6);
+  const ring = Math.max(0, Math.min(1, 1.5 - d));
+  const bar = x >= 22 && x < 36 ? Math.max(0, Math.min(1, 1.6 - Math.abs(y + 0.5 - 10))) : 0;
+  return mix(Math.max(ring, bar));
+});
+
+test('resample: bicubic keeps flat colors and scales dimensions', () => {
+  const flat = makeImage(5, 4, () => [10, 200, 30]);
+  const up = V.resample(flat, 3, 'smooth');
+  assert.strictEqual(up.width, 15); assert.strictEqual(up.height, 12);
+  for (let i = 0; i < up.data.length; i += 4) assert.deepStrictEqual([...up.data.slice(i, i + 4)], [10, 200, 30, 255]);
+});
+
+test('resample: Scale2x rounds a staircase but keeps the palette', () => {
+  const stair = makeImage(4, 4, (x, y) => (x <= y ? [0, 0, 0] : [255, 255, 255]));
+  const up = V.resample(stair, 2, 'scale2x');
+  assert.strictEqual(up.width, 8);
+  const colors = new Set();
+  for (let i = 0; i < up.data.length; i += 4) colors.add(up.data[i]);
+  assert.deepStrictEqual([...colors].sort(), [0, 255]);
+  // pixel (1,0) of the doubled image sits on the diagonal and is filled in
+  assert.strictEqual(up.data[(0 * 8 + 1) * 4], 0);
+});
+
+test('pure colors drop anti-aliasing blends and keep the exact ink', () => {
+  const r = V.vectorize(smallText, { colors: 8, upscale: 8, pureColors: true, speckle: 32 });
+  assert.deepStrictEqual(r.palette.slice().sort(), ['#1f4e79', '#ffffff']);
+  const plain = V.vectorize(smallText, { colors: 8, upscale: 8, speckle: 32 });
+  assert.ok(plain.palette.length > 2, 'k-means alone keeps blend colors');
+});
+
+test('upscaling keeps thin anti-aliased strokes that native tracing loses', () => {
+  const ringHole = (r) => {
+    const ink = r.layers.find((l) => l.colors.includes('#1f4e79'));
+    return ink ? (ink.body.match(/M/g) || []).length : 0;
+  };
+  const native = V.vectorize(smallText, { colors: 2, speckle: 4, layering: 'cutout' });
+  const up = V.vectorize(smallText, { colors: 2, upscale: 8, pureColors: true, speckle: 64, layering: 'cutout' });
+  assert.strictEqual(up.stats.width, 320);
+  assert.ok(up.svg.includes('width="40"'), 'output keeps the original size');
+  assert.ok(ringHole(up) >= 3, 'ring outline + hole + bar, got ' + ringHole(up));
+  assert.ok(ringHole(up) >= ringHole(native));
+});
+
+test('auto threshold cuts halfway between ink and background', () => {
+  const t = V.otsuThreshold(smallText.data, 40 * 20, 128);
+  const inkLum = 0.2126 * INK[0] + 0.7152 * INK[1] + 0.0722 * INK[2];
+  assert.ok(Math.abs(t - (inkLum + 255) / 2) < 6, 'threshold ' + t);
+  const r = V.vectorize(smallText, { mode: 'bw', autoThreshold: true, upscale: 4 });
+  assert.strictEqual(r.stats.threshold, t);
+});
+
 console.log(passed + ' tests passed');

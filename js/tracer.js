@@ -795,6 +795,254 @@
   }
 
   // ------------------------------------------------------------------
+  // Upscaling before tracing
+  //
+  // Potrace places edges on pixel boundaries, so features one or two pixels
+  // wide (small text, icons) collapse or turn into blobs at their native size.
+  // Upscaling first gives the tracer room: a smooth (bicubic) upscale turns
+  // anti-aliased edge pixels into sub-pixel edge positions, Scale2x keeps hard
+  // pixel art crisp while rounding its diagonals, and nearest keeps the pixels.
+  // ------------------------------------------------------------------
+  var RESAMPLERS = ['smooth', 'scale2x', 'nearest'];
+
+  function resample(img, factor, method) {
+    var w = img.width, h = img.height;
+    var tw = Math.max(1, Math.round(w * factor)), th = Math.max(1, Math.round(h * factor));
+    if (tw === w && th === h) return img;
+    if (method === 'nearest' || tw < w) return resampleNearest(img, tw, th);
+    if (method === 'scale2x') {
+      var cur = img;
+      while (cur.width < tw || cur.height < th) cur = scale2x(cur);
+      return cur.width === tw && cur.height === th ? cur : resampleNearest(cur, tw, th);
+    }
+    return resampleBicubic(img, tw, th);
+  }
+
+  function words(img) {
+    var d = img.data;
+    if (d.byteOffset % 4) d = new Uint8ClampedArray(d);
+    return new Uint32Array(d.buffer, d.byteOffset, img.width * img.height);
+  }
+
+  function resampleNearest(img, tw, th) {
+    var w = img.width, h = img.height, out = new Uint8ClampedArray(tw * th * 4);
+    var src32 = words(img), out32 = new Uint32Array(out.buffer);
+    var xs = new Int32Array(tw);
+    for (var x = 0; x < tw; x++) xs[x] = Math.min(w - 1, Math.floor((x + 0.5) * w / tw));
+    for (var y = 0; y < th; y++) {
+      var sy = Math.min(h - 1, Math.floor((y + 0.5) * h / th)) * w, row = y * tw;
+      for (x = 0; x < tw; x++) out32[row + x] = src32[sy + xs[x]];
+    }
+    return { data: out, width: tw, height: th };
+  }
+
+  // Scale2x / EPX (Mazzoleni, 2001): doubles the image, filling each pixel's
+  // corners from matching neighbours so staircases become 45-degree diagonals.
+  function scale2x(img) {
+    var w = img.width, h = img.height, s = words(img);
+    var W = w * 2, out = new Uint8ClampedArray(W * h * 2 * 4), d = new Uint32Array(out.buffer);
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        var E = s[y * w + x];
+        var B = y > 0 ? s[(y - 1) * w + x] : E, H = y < h - 1 ? s[(y + 1) * w + x] : E;
+        var D = x > 0 ? s[y * w + x - 1] : E, F = x < w - 1 ? s[y * w + x + 1] : E;
+        var e0 = E, e1 = E, e2 = E, e3 = E;
+        if (B !== H && D !== F) {
+          if (D === B) e0 = D;
+          if (B === F) e1 = F;
+          if (D === H) e2 = D;
+          if (H === F) e3 = F;
+        }
+        var o = y * 2 * W + x * 2;
+        d[o] = e0; d[o + 1] = e1; d[o + W] = e2; d[o + W + 1] = e3;
+      }
+    }
+    return { data: out, width: W, height: h * 2 };
+  }
+
+  // Separable Catmull-Rom bicubic on premultiplied alpha, so transparent
+  // pixels do not bleed their (meaningless) color into the edges.
+  function cubicWeights(srcLen, dstLen) {
+    var idx = new Int32Array(dstLen * 4), wt = new Float32Array(dstLen * 4), scale = srcLen / dstLen;
+    for (var i = 0; i < dstLen; i++) {
+      var c = (i + 0.5) * scale - 0.5, base = Math.floor(c), t = c - base;
+      for (var k = 0; k < 4; k++) {
+        var xk = Math.abs(t - (k - 1)), v;
+        v = xk < 1 ? 1.5 * xk * xk * xk - 2.5 * xk * xk + 1
+          : xk < 2 ? -0.5 * xk * xk * xk + 2.5 * xk * xk - 4 * xk + 2 : 0;
+        idx[i * 4 + k] = Math.min(srcLen - 1, Math.max(0, base + k - 1));
+        wt[i * 4 + k] = v;
+      }
+    }
+    return { idx: idx, wt: wt };
+  }
+  function resampleBicubic(img, tw, th) {
+    var w = img.width, h = img.height, src = img.data, i, j, k, c;
+    var pre = new Float32Array(w * h * 4);
+    for (i = 0; i < w * h; i++) {
+      var a = src[i * 4 + 3] / 255;
+      pre[i * 4] = src[i * 4] * a; pre[i * 4 + 1] = src[i * 4 + 1] * a; pre[i * 4 + 2] = src[i * 4 + 2] * a; pre[i * 4 + 3] = src[i * 4 + 3];
+    }
+    var cx = cubicWeights(w, tw), cy = cubicWeights(h, th);
+    var mid = new Float32Array(tw * h * 4);
+    for (j = 0; j < h; j++) {
+      for (i = 0; i < tw; i++) {
+        var o = (j * tw + i) * 4;
+        for (k = 0; k < 4; k++) {
+          var sp = (j * w + cx.idx[i * 4 + k]) * 4, wk = cx.wt[i * 4 + k];
+          for (c = 0; c < 4; c++) mid[o + c] += pre[sp + c] * wk;
+        }
+      }
+    }
+    var out = new Uint8ClampedArray(tw * th * 4), acc = [0, 0, 0, 0];
+    for (j = 0; j < th; j++) {
+      for (i = 0; i < tw; i++) {
+        acc[0] = acc[1] = acc[2] = acc[3] = 0;
+        for (k = 0; k < 4; k++) {
+          var mp = (cy.idx[j * 4 + k] * tw + i) * 4, wy = cy.wt[j * 4 + k];
+          for (c = 0; c < 4; c++) acc[c] += mid[mp + c] * wy;
+        }
+        var op = (j * tw + i) * 4, al = Math.min(255, Math.max(0, acc[3]));
+        out[op + 3] = al;
+        if (al > 0) {
+          var inv = 255 / al;
+          out[op] = acc[0] * inv; out[op + 1] = acc[1] * inv; out[op + 2] = acc[2] * inv;
+        }
+      }
+    }
+    return { data: out, width: tw, height: th };
+  }
+
+  // Position t of color c along the sRGB segment a-b, and its distance from it.
+  function blendFit(a, b, c) {
+    var dx = b[0] - a[0], dy = b[1] - a[1], dz = b[2] - a[2], L = dx * dx + dy * dy + dz * dz;
+    if (!L) return { t: 0, dist: Infinity };
+    var t = ((c[0] - a[0]) * dx + (c[1] - a[1]) * dy + (c[2] - a[2]) * dz) / L;
+    var tc = Math.max(0, Math.min(1, t));
+    var ex = a[0] + tc * dx - c[0], ey = a[1] + tc * dy - c[1], ez = a[2] + tc * dz - c[2];
+    return { t: t, dist: Math.sqrt(ex * ex + ey * ey + ez * ez) };
+  }
+
+  // Otsu's method: the luminance cut that best separates ink from background.
+  function otsuThreshold(px, n, alphaCut) {
+    var hist = new Float64Array(256), total = 0, i;
+    for (i = 0; i < n; i++) {
+      if (px[i * 4 + 3] < alphaCut) continue;
+      hist[Math.round(0.2126 * px[i * 4] + 0.7152 * px[i * 4 + 1] + 0.0722 * px[i * 4 + 2])]++;
+      total++;
+    }
+    if (!total) return 128;
+    var sumAll = 0;
+    for (i = 0; i < 256; i++) sumAll += i * hist[i];
+    var wB = 0, sumB = 0, best = -1, lo = 128, hi = 128;
+    for (i = 0; i < 256; i++) {
+      wB += hist[i];
+      if (!wB) continue;
+      var wF = total - wB;
+      if (!wF) break;
+      sumB += i * hist[i];
+      var mB = sumB / wB, mF = (sumAll - sumB) / wF, between = wB * wF * (mB - mF) * (mB - mF);
+      if (between > best + 1e-9) { best = between; lo = hi = i; }
+      else if (Math.abs(between - best) <= 1e-9) hi = i;
+    }
+    // Otsu only splits the histogram; anti-aliased edge pixels pull it towards
+    // the larger class. Cutting halfway between the two classes' peaks (the
+    // pure ink and the pure background) puts edges at 50% coverage instead.
+    var cut = Math.round((lo + hi) / 2), pd = 0, pl = 255, nd = -1, nl = -1;
+    for (i = 0; i <= cut; i++) if (hist[i] > nd) { nd = hist[i]; pd = i; }
+    for (i = cut + 1; i < 256; i++) if (hist[i] > nl) { nl = hist[i]; pl = i; }
+    if (nl <= 0) return Math.min(255, cut + 1);
+    return Math.max(1, Math.min(255, Math.round((pd + pl) / 2) + 1));
+  }
+
+  // Anti-aliased edges are blends of their neighbours, so a k-means centroid
+  // is paler than the real ink and its region boundary drifts outward. Pure
+  // colors replace each centroid with the most common exact source color in
+  // its cluster, then reassign every pixel to the nearest pure color: edges
+  // then land at 50% coverage, where the original artwork had them.
+  function purifyPalette(src, srcN, px, n, indices, palette, alphaCut, gray) {
+    var k = palette.length, lab = new Float64Array(k * 3), tmp = new Float64Array(3), i, j;
+    function rgbOf(a, p) {
+      var r = a[p * 4], g = a[p * 4 + 1], b = a[p * 4 + 2];
+      if (gray) r = g = b = Math.round(0.2126 * r + 0.7152 * g + 0.0722 * b);
+      return (r << 16) | (g << 8) | b;
+    }
+    function nearest(key, cents, kk) {
+      toOklab((key >> 16) & 255, (key >> 8) & 255, key & 255, tmp, 0);
+      var best = 0, bd = Infinity;
+      for (var c = 0; c < kk; c++) {
+        var d = sq3(tmp, 0, cents, c * 3);
+        if (d < bd) { bd = d; best = c; }
+      }
+      return best;
+    }
+    for (j = 0; j < k; j++) toOklab(palette[j][0], palette[j][1], palette[j][2], lab, j * 3);
+    var tallies = [], cache = new Map();
+    for (j = 0; j < k; j++) tallies.push(new Map());
+    for (i = 0; i < srcN; i++) {
+      if (src[i * 4 + 3] < alphaCut) continue;
+      var key = rgbOf(src, i), c = cache.get(key);
+      if (c === undefined) { c = nearest(key, lab, k); cache.set(key, c); }
+      tallies[c].set(key, (tallies[c].get(key) || 0) + 1);
+    }
+    var pure = [], seen = {};
+    for (j = 0; j < k; j++) {
+      var bestKey = -1, bestN = 0;
+      tallies[j].forEach(function (cnt, kk) { if (cnt > bestN) { bestN = cnt; bestKey = kk; } });
+      if (bestKey < 0 || seen[bestKey]) continue;
+      seen[bestKey] = 1;
+      pure.push([(bestKey >> 16) & 255, (bestKey >> 8) & 255, bestKey & 255]);
+    }
+    if (!pure.length) return null;
+    var pureN = pure.map(function (c) {
+      var t = 0;
+      tallies.forEach(function (m) { t += m.get((c[0] << 16) | (c[1] << 8) | c[2]) || 0; });
+      return t;
+    });
+
+    // A color that sits on the line between two more common colors is an
+    // anti-aliasing blend of them (edge pixels are partly one, partly the
+    // other). Drop it; its pixels go to whichever end they are closer to.
+    var order = pure.map(function (_, ix) { return ix; }).sort(function (a, b) { return pureN[b] - pureN[a]; });
+    var kept = [], blendOf = {};
+    order.forEach(function (ix) {
+      var c = pure[ix], best = null;
+      for (var a = 0; a < kept.length; a++) {
+        for (var b = a + 1; b < kept.length; b++) {
+          var f = blendFit(pure[kept[a]], pure[kept[b]], c);
+          if (f.dist < 14 && f.t > 0.04 && f.t < 0.96 && (!best || f.dist < best.dist)) best = { a: kept[a], b: kept[b], dist: f.dist };
+        }
+      }
+      if (best) blendOf[ix] = best; else kept.push(ix);
+    });
+    kept.sort(function (a, b) { return a - b; });
+    var finalPal = kept.map(function (ix) { return pure[ix]; });
+    var slot = {};
+    kept.forEach(function (ix, s2) { slot[ix] = s2; });
+
+    var plab = new Float64Array(pure.length * 3), counts = new Array(finalPal.length).fill(0);
+    for (j = 0; j < pure.length; j++) toOklab(pure[j][0], pure[j][1], pure[j][2], plab, j * 3);
+    cache = new Map();
+    for (i = 0; i < n; i++) {
+      if (indices[i] === TRANSPARENT) continue;
+      var pk = rgbOf(px, i), pc = cache.get(pk);
+      if (pc === undefined) {
+        pc = nearest(pk, plab, pure.length);
+        var bl = blendOf[pc];
+        if (bl) {
+          var tt = blendFit(pure[bl.a], pure[bl.b], [(pk >> 16) & 255, (pk >> 8) & 255, pk & 255]).t;
+          pc = tt < 0.5 ? bl.a : bl.b;
+        }
+        pc = slot[pc];
+        cache.set(pk, pc);
+      }
+      indices[i] = pc;
+      counts[pc]++;
+    }
+    return { palette: finalPal, counts: counts, blends: pure.length - finalPal.length };
+  }
+
+  // ------------------------------------------------------------------
   // Color quantization
   // ------------------------------------------------------------------
   var TRANSPARENT = 0xFFFF;
@@ -841,7 +1089,7 @@
         indices[i] = id;
         counts[id]++;
       }
-      return { indices: indices, palette: palette, counts: counts };
+      return { indices: indices, palette: palette, counts: counts, exact: true };
     }
 
     // --- k-means++ on a deterministic sample, in OKLab space.
@@ -1025,6 +1273,10 @@
     order: 'lightness',   // stacking order: 'lightness' (dark at bottom) | 'area' (largest at bottom)
     lightFirst: false,    // with order 'lightness': put light colors at the bottom
     pixelExact: false,    // emit exact pixel-edge polygons, no curve fitting
+    upscale: 1,           // enlarge the bitmap this much before tracing (small text, icons)
+    resample: 'smooth',   // upscale method: 'smooth' (bicubic) | 'scale2x' (pixel art) | 'nearest'
+    pureColors: false,    // palette = most common exact source color per cluster, not the mean
+    autoThreshold: false, // 'bw': pick the threshold with Otsu's method
     outWidth: 0,          // SVG width in user units (defaults to bitmap width)
     outHeight: 0,
     decimals: 2,
@@ -1044,8 +1296,14 @@
     for (key in options || {}) if (options[key] !== undefined) o[key] = options[key];
     var progress = onProgress || function () {};
 
-    var w = img.width, h = img.height, t0 = now();
-    var outW = o.outWidth || w, outH = o.outHeight || h;
+    var t0 = now(), source = img;
+    var up = Math.min(16, Math.max(1, +o.upscale || 1));
+    if (up > 1) {
+      progress('Upscaling', 0);
+      img = resample(img, up, RESAMPLERS.indexOf(o.resample) >= 0 ? o.resample : 'smooth');
+    }
+    var w = img.width, h = img.height;
+    var outW = o.outWidth || source.width, outH = o.outHeight || source.height;
     var sx = outW / w, sy = outH / h;
     var decimals = o.decimals;
     if (sx < 0.75 && decimals < 3) decimals = 3;
@@ -1108,12 +1366,14 @@
     }
 
     var n = w * h, i;
+    var threshold = o.threshold;
     if (o.mode === 'bw') {
       var mask = new Uint8Array(n), alphaCut = 128;
+      if (o.autoThreshold) threshold = otsuThreshold(source.data, source.width * source.height, alphaCut);
       for (i = 0; i < n; i++) {
         if (px[i * 4 + 3] < alphaCut) continue;
         var lum = 0.2126 * px[i * 4] + 0.7152 * px[i * 4 + 1] + 0.0722 * px[i * 4 + 2];
-        mask[i] = (o.invert ? lum >= o.threshold : lum < o.threshold) ? 1 : 0;
+        mask[i] = (o.invert ? lum >= threshold : lum < threshold) ? 1 : 0;
       }
       // speckle removal on the binary image
       if (o.speckle > 1) {
@@ -1136,6 +1396,11 @@
         progress('Quantizing colors', f);
       });
       indices = q.indices; palette = q.palette; counts = q.counts;
+      if (o.pureColors && palette.length > 1 && !q.exact) {
+        var pure = purifyPalette(source.data, source.width * source.height, px, n, indices, palette,
+                                 o.alphaThreshold == null ? 128 : o.alphaThreshold, o.mode === 'gray');
+        if (pure) { palette = pure.palette; counts = pure.counts; }
+      }
       var k = palette.length;
       progress('Removing speckles', 0);
       if (o.speckle > 1 && k > 1) {
@@ -1256,6 +1521,7 @@
       stats: {
         width: w,
         height: h,
+        threshold: o.mode === 'bw' ? threshold : undefined,
         colors: usedPalette.length,
         layers: outLayers.length,
         paths: pathCount,
@@ -1588,6 +1854,8 @@
     quantize: quantize,
     mergeSpeckles: mergeSpeckles,
     buildSvg: buildSvg,
+    resample: resample,
+    otsuThreshold: otsuThreshold,
     DEFAULTS: DEFAULTS
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

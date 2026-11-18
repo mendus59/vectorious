@@ -4,7 +4,7 @@
   "description": "Client-side raster to SVG vectorizer (classic tracing, no AI)",
   "private": true,
   "scripts": {
-    "test": "node test/tracer.test.js",
+    "test": "node test/tracer.test.js && node test/text.test.js",
     "start": "python3 -m http.server 8000"
   }
 }

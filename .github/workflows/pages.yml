@@ -23,6 +23,7 @@ jobs:
         with:
           node-version: 20
       - run: node test/tracer.test.js
+      - run: node test/text.test.js
 
   deploy:
     needs: test
@@ -35,7 +36,7 @@ jobs:
       - name: Assemble site
         run: |
           mkdir _site
-          cp -r index.html css js .nojekyll _site/
+          cp -r index.html css js fonts .nojekyll _site/
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
