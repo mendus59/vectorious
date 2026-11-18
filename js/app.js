@@ -4,14 +4,14 @@
 
   var MAX_WORK_PIXELS = 8e6; // cap on the traced bitmap size, keeps memory sane
 
-  var BASE = { pureColors: false, autoThreshold: false, resample: 'smooth', layering: 'stacked', order: 'lightness' };
+  var BASE = { pureColors: false, autoThreshold: false, refine: false, resample: 'smooth', layering: 'stacked', order: 'lightness' };
   var PRESETS = {
     max:          { mode: 'color', colors: 64, scale: 2, blur: 0, speckle: 2, alphamax: 1, opticurve: true, opttolerance: 0.1, pixelExact: false },
     photo:        { mode: 'color', colors: 48, scale: 1, blur: 1, speckle: 12, alphamax: 1, opticurve: true, opttolerance: 0.2, pixelExact: false },
     illustration: { mode: 'color', colors: 16, scale: 1, blur: 0, speckle: 4, alphamax: 1, opticurve: true, opttolerance: 0.2, pixelExact: false },
     // Small, anti-aliased text and icons: a smooth 8x upscale gives the tracer
     // sub-pixel edges, and pure colors drop the blended edge pixels.
-    smalltext:    { mode: 'color', colors: 8, pureColors: true, scale: 8, resample: 'smooth', blur: 0, speckle: 2, alphamax: 1, opticurve: true, opttolerance: 0.2, pixelExact: false },
+    smalltext:    { mode: 'color', colors: 8, pureColors: true, refine: true, scale: 8, resample: 'smooth', blur: 0, speckle: 2, alphamax: 1, opticurve: true, opttolerance: 0.2, pixelExact: false },
     lineart:      { mode: 'bw', threshold: 128, autoThreshold: true, invert: false, bwBackground: true, scale: 2, blur: 0, speckle: 8, alphamax: 1, opticurve: true, opttolerance: 0.2, pixelExact: false },
     pixel:        { mode: 'color', colors: 64, scale: 1, blur: 0, speckle: 0, alphamax: 0, opticurve: false, opttolerance: 0.2, pixelExact: true },
     pixelsmooth:  { mode: 'color', colors: 64, scale: 8, resample: 'scale2x', blur: 0, speckle: 0, alphamax: 0.6, opticurve: true, opttolerance: 0.2, pixelExact: false }
@@ -20,7 +20,7 @@
     Object.keys(BASE).forEach(function (b) { if (!(b in PRESETS[k])) PRESETS[k][b] = BASE[b]; });
   });
   var SMALL_IMAGE = 400; // longest side in px below which small-text tracing is suggested
-  var CONTROL_IDS = ['mode', 'colors', 'pureColors', 'threshold', 'autoThreshold', 'invert', 'bwBackground', 'scale', 'resample', 'blur', 'speckle', 'pixelExact', 'alphamax', 'opticurve', 'opttolerance', 'layering', 'order', 'groupBy', 'maxLayers'];
+  var CONTROL_IDS = ['mode', 'colors', 'pureColors', 'threshold', 'autoThreshold', 'invert', 'bwBackground', 'scale', 'resample', 'blur', 'speckle', 'pixelExact', 'refine', 'alphamax', 'opticurve', 'opttolerance', 'layering', 'order', 'groupBy', 'maxLayers'];
 
   var GROUP_HINTS = {
     color: 'One layer per color, with similar colors merged.',
@@ -73,6 +73,7 @@
       blur: +$('blur').value,
       speckle: +$('speckle').value,
       pixelExact: $('pixelExact').checked,
+      refine: $('refine').checked,
       alphamax: +$('alphamax').value,
       opticurve: $('opticurve').checked,
       opttolerance: +$('opttolerance').value,
@@ -261,7 +262,7 @@
       speckle: Math.round(opts.speckle * traceScale * traceScale),
       alphamax: opts.pixelExact ? 0 : opts.alphamax,
       opticurve: opts.opticurve, opttolerance: opts.opttolerance,
-      pixelExact: opts.pixelExact, layering: opts.layering, order: opts.order,
+      pixelExact: opts.pixelExact, refine: opts.refine, layering: opts.layering, order: opts.order,
       groupBy: opts.groupBy, maxLayers: opts.maxLayers,
       outWidth: state.w, outHeight: state.h
     };
@@ -325,6 +326,7 @@
       (s.segments ? ' · ' + s.segments.toLocaleString() + ' segments' : '') +
       ' · <b>' + formatBytes(s.bytes) + '</b> in all · ' + (elapsed / 1000).toFixed(2) + ' s' +
       (s.threshold != null && $('autoThreshold').checked ? ' · auto threshold ' + s.threshold : '') +
+      (s.refined === true ? ' · edges refined' : s.refined ? ' · not refined (' + s.refined + ')' : '') +
       (s.bytes > 25e6 ? ' · <b>Very large file.</b> For photos try the Photo preset, Denoise, or a higher Speckle filter.' : '') +
       (Math.max(state.w, state.h) <= SMALL_IMAGE && +$('scale').value < 4 && !$('pixelExact').checked
         ? ' · Small image: <button type="button" class="linkbtn" id="useSmallText">try the Small text / icon preset</button>' : '');
@@ -688,7 +690,9 @@
     try {
       var t = readTextOptions();
       delete t.font;
-      t.font = fontById($('font').value) && fontById($('font').value).file ? $('font').value : null;
+      var fe = fontById($('font').value);
+      t.font = fe && fe.file ? $('font').value : null;
+      t.userFont = fe && fe.traced ? fe.id : null;
       localStorage.setItem('vectorious.text', JSON.stringify(t));
     } catch (_) { /* storage unavailable */ }
   }
@@ -722,6 +726,7 @@
     var has = !!state.image;
     $('fitText').disabled = !has;
     $('findFont').disabled = !has;
+    $('makeFont').disabled = !has;
     $('textCrop').closest('.check').hidden = !has;
     $('matchNote').textContent = has
       ? 'Type the words in the image above, then fit them. Matching compares letter shapes with the image; it is not AI.'
@@ -739,14 +744,20 @@
     var t = readTextOptions(), entry = fontById(t.font), job = ++textJob;
     if (!entry) return;
     showBusy('Loading ' + entry.name, 0.3);
-    loadFont(entry).then(function (font) {
+    var fbEntry = entry.group === 'Your fonts' ? fontById($('fallbackFont').value) : null;
+    Promise.all([loadFont(entry), fbEntry ? loadFont(fbEntry).catch(function () { return null; }) : null]).then(function (fonts) {
+      var font = fonts[0], fb = fonts[1];
       if (job !== textJob) return;
       hideBusy();
+      refreshFontTools();
       var onImage = !!state.image && !t.crop;
       state.text.free = !onImage;
       var o = {
         size: t.size, letterSpacing: t.letterSpacing, scaleX: t.scaleX, lineHeight: t.lineHeight,
-        align: t.align, smallCaps: t.smallCaps, fill: t.fill, background: t.background
+        align: t.align, smallCaps: t.smallCaps, fill: t.fill, background: t.background,
+        fallback: fb, fallbackScale: fb ? window.VectoriousText.capRatio(font) / window.VectoriousText.capRatio(fb) : 1,
+        // traced lettering in small caps: borrowed lowercase become small capitals too
+        fallbackSmallCaps: fb && entry.traced && entry.smallCaps ? entry.smallCaps : 0
       };
       if (onImage) {
         // Keep the text centred on its anchor: the fitted position, else the image centre.
@@ -769,7 +780,8 @@
       rebuildVisible();
       updateView();
       els.stats.innerHTML = '<b>' + escapeHtml(entry.name) + '</b> · <b>' + r.glyphs + '</b> letters · ' + r.width + '×' + r.height +
-        ' · <b>' + formatBytes(state.svg.length) + '</b>' + (onImage ? ' · drawn on the image canvas' : '');
+        ' · <b>' + formatBytes(state.svg.length) + '</b>' + (onImage ? ' · drawn on the image canvas' : '') +
+        (state.text.note ? '<br>' + state.text.note : '');
       els.palette.innerHTML = '';
     }).catch(function (err) {
       if (job !== textJob) return;
@@ -886,6 +898,134 @@
     }
   }
 
+  // ------------------------------------------------------------------
+  // Making a font from the image's own lettering
+  // ------------------------------------------------------------------
+  function refreshFontTools() {
+    var e = fontById($('font').value);
+    var user = !!e && e.group === 'Your fonts';
+    $('fallbackField').hidden = !user;
+    $('downloadFont').hidden = !(e && e.traced);
+  }
+
+  function makeFontFromImage() {
+    if (!state.image || needWords()) return;
+    var words = $('textInput').value;
+    showBusy('Tracing the letters', 0.1);
+    loadOpentype().then(function () {
+      setTimeout(function () {
+        try {
+          var w = state.w, h = state.h;
+          var c = document.createElement('canvas');
+          c.width = w; c.height = h;
+          var g = c.getContext('2d', { willReadFrequently: true });
+          g.drawImage(state.image, 0, 0);
+          var img = g.getImageData(0, 0, w, h);
+          var ink = window.VectoriousText.inkOf(img);
+          if (!ink.box) throw new Error('No lettering found in the image.');
+          // small text needs room to trace; keep the work under ~2 megapixels
+          var up = Math.max(1, Math.min(8, Math.sqrt(2e6 / (w * h))));
+          var r = window.Vectorious.vectorize(img, {
+            mode: 'color', colors: 8, pureColors: true, upscale: up, resample: 'smooth',
+            speckle: Math.round(2 * up * up), alphamax: 1, opttolerance: 0.2,
+            groupBy: 'size', returnObjects: true, refine: true
+          });
+          var inkHex = window.VectoriousText.hex(ink.ink), bgHex = ink.background ? window.VectoriousText.hex(ink.background) : null;
+          // the shapes in the ink's color (the palette color nearest to it)
+          var dist = function (hx) {
+            var v = parseInt(hx.slice(1), 16);
+            return Math.hypot(((v >> 16) & 255) - ink.ink[0], ((v >> 8) & 255) - ink.ink[1], (v & 255) - ink.ink[2]);
+          };
+          var inkColor = r.palette.filter(function (hx) { return hx !== bgHex; }).sort(function (a, b) { return dist(a) - dist(b); })[0];
+          var shapes = r.objects.filter(function (ob) { return ob.color === inkColor; });
+          var name = 'Traced ' + (words.trim().replace(/\s+/g, ' ').replace(/[^\w !?.,'-]/g, '').slice(0, 28) || 'lettering');
+          var made = window.VectoriousText.fontFromShapes(window.opentype, shapes, words, { familyName: name });
+          var entry = registerTracedFont(name, made.font);
+          entry.smallCaps = tracedSmallCaps(made.font);
+          storeTracedFont(name, made.font);
+          hideBusy();
+          $('font').value = entry.id;
+          $('textSize').value = Math.round(made.sizePx * 2) / 2;
+          $('letterSpacing').value = 0;
+          $('scaleX').value = 1;
+          $('smallCaps').checked = false;
+          $('textCrop').checked = false;
+          $('textFill').value = inkHex;
+          $('textBgOn').checked = !!bgHex;
+          if (bgHex) $('textBg').value = bgHex;
+          state.text.anchor = { x: (ink.box.x1 + ink.box.x2) / 2, y: (ink.box.y1 + ink.box.y2) / 2 };
+          refreshTextControls();
+          saveTextSettings();
+          state.text.note = 'Made <b>' + escapeHtml(name) + '</b> with ' + made.chars.length + ' characters: ' +
+            escapeHtml(made.chars.join(' ')) + (made.synthesized.length ? ' (' + made.synthesized.length + ' scaled from the other case)' : '') +
+            (r.stats.refined === true ? ' · edges refined against the image' : '');
+          renderText();
+        } catch (err) {
+          hideBusy();
+          showError(err);
+        }
+      }, 20);
+    }).catch(showError);
+  }
+
+  function registerTracedFont(name, font) {
+    var id = 'traced-' + name.toLowerCase().replace(/^traced\s+/, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    var entry = fontById(id);
+    if (!entry) { entry = { id: id, name: name, group: 'Your fonts', traced: true }; FONTS.unshift(entry); }
+    entry.font = font;
+    entry.smallCaps = tracedSmallCaps(font);
+    buildFontSelect();
+    return entry;
+  }
+
+  // Lowercase drawn as capitals (small caps lettering)? Then the case ratio, else 0.
+  function tracedSmallCaps(font) {
+    var lo = font.charToGlyph('a'), up = font.charToGlyph('A'), r = window.VectoriousText.caseRatio(font);
+    if (!lo || !up || lo.index === 0 || up.index === 0 || !r) return 0;
+    // the scaled-up capital has the same outline as the lowercase letter: compare their widths at equal height
+    var a = lo.getBoundingBox(), b = up.getBoundingBox();
+    var same = Math.abs((a.x2 - a.x1) / (a.y2 - a.y1) - (b.x2 - b.x1) / (b.y2 - b.y1)) < 0.05;
+    return same ? r : 0;
+  }
+
+  function storeTracedFont(name, font) {
+    try {
+      var bytes = new Uint8Array(font.toArrayBuffer()), bin = '';
+      for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+      var list = JSON.parse(localStorage.getItem('vectorious.tracedFonts') || '[]').filter(function (f) { return f.name !== name; });
+      list.unshift({ name: name, b64: btoa(bin) });
+      localStorage.setItem('vectorious.tracedFonts', JSON.stringify(list.slice(0, 8)));
+    } catch (_) { /* storage full or unavailable: the font lasts for this visit */ }
+  }
+
+  function restoreTracedFonts() {
+    var list;
+    try { list = JSON.parse(localStorage.getItem('vectorious.tracedFonts') || '[]'); } catch (_) { return Promise.resolve(); }
+    if (!list.length) return Promise.resolve();
+    return loadOpentype().then(function () {
+      list.slice().reverse().forEach(function (f) {
+        try {
+          var bin = atob(f.b64), bytes = new Uint8Array(bin.length);
+          for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          registerTracedFont(f.name, window.opentype.parse(bytes.buffer));
+        } catch (_) { /* skip a damaged entry */ }
+      });
+    }).catch(function () {});
+  }
+
+  function downloadTracedFont() {
+    var e = fontById($('font').value);
+    if (!e || !e.font) return;
+    var url = URL.createObjectURL(new Blob([e.font.toArrayBuffer()], { type: 'font/otf' }));
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = e.name.replace(/[^\w-]+/g, '-').replace(/^-|-$/g, '') + '.otf';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+  }
+
   function setWork(work) {
     state.work = work;
     document.querySelectorAll('[data-work-tab]').forEach(function (b) { b.classList.toggle('on', b.getAttribute('data-work-tab') === work); });
@@ -923,6 +1063,7 @@
       var el = $(id);
       var ev = el.type === 'range' || el.tagName === 'TEXTAREA' || el.type === 'color' ? 'input' : 'change';
       el.addEventListener(ev, function () {
+        state.text.note = null;
         refreshTextControls();
         saveTextSettings();
         scheduleText(ev === 'input' ? 120 : 0);
@@ -950,14 +1091,38 @@
         els.stats.textContent = added + ' installed fonts added to the font list under "Your fonts".';
       }).catch(function (err) { showError(err); });
     });
+    var fb = $('fallbackFont');
+    FONTS.forEach(function (f) {
+      if (!f.file) return;
+      var op = document.createElement('option');
+      op.value = f.id; op.textContent = f.name;
+      fb.appendChild(op);
+    });
+    try { fb.value = localStorage.getItem('vectorious.fallback') || 'ShortStack-Regular'; } catch (_) { fb.value = 'ShortStack-Regular'; }
+    if (!fb.value) fb.value = '';
+    fb.addEventListener('change', function () {
+      try { localStorage.setItem('vectorious.fallback', fb.value); } catch (_) { /* ignore */ }
+      renderText();
+    });
+    $('font').addEventListener('change', refreshFontTools);
+    $('makeFont').onclick = makeFontFromImage;
+    $('downloadFont').onclick = downloadTracedFont;
     $('fitText').onclick = fitCurrentFont;
     $('findFont').onclick = findClosestFont;
     document.querySelectorAll('[data-work-tab]').forEach(function (b) {
       b.onclick = function () { setWork(b.getAttribute('data-work-tab')); };
     });
-    var saved = null;
-    try { saved = localStorage.getItem('vectorious.work'); } catch (_) { /* ignore */ }
-    if (saved === 'text') setWork('text');
+    var saved = null, savedFont = null;
+    try {
+      saved = localStorage.getItem('vectorious.work');
+      savedFont = (JSON.parse(localStorage.getItem('vectorious.text') || 'null') || {}).userFont;
+    } catch (_) { /* ignore */ }
+    var start = function () { if (saved === 'text') setWork('text'); };
+    restoreTracedFonts().then(function () {
+      if (savedFont && fontById(savedFont)) $('font').value = savedFont;
+      refreshFontTools();
+      start();
+    });
   }
 
   // ------------------------------------------------------------------

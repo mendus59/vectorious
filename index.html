@@ -84,6 +84,15 @@
         <button type="button" class="btn wide" id="fitText" disabled>Fit this font to the image</button>
         <button type="button" class="btn primary wide" id="findFont" disabled>Find the closest font</button>
         <ol class="font-results" id="fontResults"></ol>
+        <h2 class="subhead">Or make a new font</h2>
+        <p class="muted note">Cuts the image's own letters apart, using the words above as their names, and builds a font from them. Only letters in the image exist; the other case is scaled from them.</p>
+        <button type="button" class="btn wide" id="makeFont" disabled>Make a font from this image</button>
+        <label class="field" id="fallbackField" hidden>
+          <span>Letters it doesn't have</span>
+          <select id="fallbackFont"><option value="">Leave out</option></select>
+          <small>Borrowed from this font, sized to match.</small>
+        </label>
+        <button type="button" class="btn wide" id="downloadFont" hidden>Download font (.otf)</button>
         <label class="check" hidden><input type="checkbox" id="textCrop"> Size the SVG to the text, not the image</label>
       </section>
       <section class="group" data-work="trace">
@@ -164,6 +173,7 @@
           <small>0 keeps every corner sharp, higher rounds corners into curves.</small>
         </label>
         <label class="check" data-curves><input type="checkbox" id="opticurve" checked> Simplify curves</label>
+        <label class="check" data-curves><input type="checkbox" id="refine"> Refine edges against the original (two colors)</label>
         <label class="field range" data-curves>
           <span>Simplify tolerance <output for="opttolerance"></output></span>
           <input type="range" id="opttolerance" min="0.05" max="1.5" step="0.05" value="0.2">

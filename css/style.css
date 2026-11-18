@@ -244,3 +244,4 @@ body {
 .font-results li button:hover { border-color: var(--accent); }
 .font-results li.on button { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
 .font-results small { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
+.group h2.subhead { margin-top: 16px; }

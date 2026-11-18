@@ -232,4 +232,34 @@ test('auto threshold cuts halfway between ink and background', () => {
   assert.strictEqual(r.stats.threshold, t);
 });
 
+
+test('refine moves outlines closer to the original pixels', () => {
+  // coverage of the ink in the source image
+  const target = new Float32Array(40 * 20);
+  for (let i = 0; i < 40 * 20; i++) target[i] = (255 - smallText.data[i * 4]) / (255 - INK[0]);
+  const score = (r) => {
+    const ink = r.layers.find((l) => l.colors.includes('#1f4e79'));
+    const d = [...ink.body.matchAll(/ d="([^"]+)"/g)].map((m) => m[1]).join('');
+    const cov = V.rasterizePolys(V.dToPolys(d), 40, 20, 8);
+    let inter = 0, uni = 0;
+    for (let i = 0; i < cov.length; i++) { const a = Math.min(1, cov[i]), b = target[i]; inter += Math.min(a, b); uni += Math.max(a, b); }
+    return inter / uni;
+  };
+  const base = { colors: 8, upscale: 8, pureColors: true, speckle: 32 };
+  const plain = V.vectorize(smallText, Object.assign({ layering: 'cutout' }, base));
+  const refined = V.vectorize(smallText, Object.assign({ layering: 'cutout', refine: true }, base));
+  assert.strictEqual(refined.stats.refined, true);
+  assert.ok(score(refined) > score(plain) + 0.01, score(plain).toFixed(3) + ' -> ' + score(refined).toFixed(3));
+  assert.ok(!/NaN|Infinity/.test(refined.svg));
+  // stacked output puts the background at the bottom, so nothing frames the image
+  const stacked = V.vectorize(smallText, Object.assign({ refine: true }, base));
+  assert.ok(stacked.svg.includes('<rect width="40" height="20" fill="#ffffff"/>'));
+});
+
+test('refine is skipped for more than two colors', () => {
+  const img = makeImage(30, 30, (x) => (x < 10 ? [255, 0, 0] : x < 20 ? [0, 255, 0] : [0, 0, 255]));
+  const r = V.vectorize(img, { colors: 3, speckle: 0, refine: true });
+  assert.strictEqual(r.stats.refined, 'needs exactly two colors');
+});
+
 console.log(passed + ' tests passed');
