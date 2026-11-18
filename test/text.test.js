@@ -108,4 +108,49 @@ test('scaleOptions converts a fit between pixel scales', () => {
   assert.deepStrictEqual([o.size, o.x, o.y, o.letterSpacing, o.scaleX], [40, 8, 12, 0.1, 1.2]);
 });
 
+
+test('a font made from traced lettering reproduces it', () => {
+  const V = require('../js/tracer.js');
+  const words = 'Big Wave';
+  const img = textImage(lato, words, { size: 36, x: 6, y: 40, letterSpacing: 0.06 }, 220, 56);
+  const r = V.vectorize(img, { colors: 4, pureColors: true, upscale: 4, speckle: 16, groupBy: 'size', returnObjects: true, refine: true });
+  const ink = r.objects.filter((o) => o.color === '#c81e3c');
+  assert.ok(ink.length >= 7, ink.length + ' shapes');
+  const made = T.fontFromShapes(opentype, ink, words, { familyName: 'Test Traced' });
+  assert.deepStrictEqual(made.chars.filter((c) => /[a-z]/i.test(c)).sort().join(''), 'ABEGIVWabegivw');
+  assert.ok(made.synthesized.includes('b') && made.synthesized.includes('A'));
+  // the font round-trips through a file and draws the same words at the measured size
+  const back = opentype.parse(made.buffer);
+  assert.strictEqual(back.names.fontFamily.en, 'Test Traced');
+  const lay = T.layout(back, words, { size: made.sizePx });
+  const src = T.inkOf(img);
+  const ratio = (lay.bbox.x2 - lay.bbox.x1) / (src.box.x2 - src.box.x1);
+  assert.ok(Math.abs(ratio - 1) < 0.06, 'width ratio ' + ratio);
+  const cx = (src.box.x1 + src.box.x2) / 2 - (lay.bbox.x1 + lay.bbox.x2) / 2, cy = (src.box.y1 + src.box.y2) / 2 - (lay.bbox.y1 + lay.bbox.y2) / 2;
+  const overlap = T.iou(T.rasterize(T.transform(lay.commands, 1, 1, cx, cy), 220, 56, 4), src.coverage);
+  assert.ok(overlap > 0.45, 'overlap ' + overlap); // thin strokes: small spacing differences cost a lot of overlap
+});
+
+test('font building splits letters that touch and keeps dots with their letter', () => {
+  const sq = (x1, y1, x2, y2) => ({ d: 'M' + x1 + ' ' + y1 + 'H' + x2 + 'V' + y2 + 'H' + x1 + 'Z', bbox: { x1, y1, x2, y2 } });
+  // "ii" where the stems touch through a bridge, plus their dots, and a separate "l"
+  const shapes = [sq(0, 4, 6, 12), sq(1, 0, 2, 2), sq(4, 0, 5, 2), sq(10, 0, 11, 12)];
+  shapes[0].d = 'M0 4H2V12H0Z M2 7H4V8H2Z M4 4H6V12H4Z';
+  const groups = T.groupLetters(shapes);
+  assert.strictEqual(groups.length, 2, 'both dots join the wide shape; the l stays apart');
+  const made = T.fontFromShapes(opentype, shapes, 'iil', { fillCase: false });
+  assert.deepStrictEqual(made.chars, ['i', 'l']);
+});
+
+test('layout borrows missing letters from a fallback font', () => {
+  const minimal = new opentype.Font({ familyName: 'Mini', styleName: 'Regular', unitsPerEm: 1000, ascender: 800, descender: -200,
+    glyphs: [new opentype.Glyph({ name: '.notdef', advanceWidth: 500, path: new opentype.Path() }),
+      new opentype.Glyph({ name: 'A', unicode: 65, advanceWidth: 600, path: (() => { const p = new opentype.Path(); p.moveTo(0, 0); p.lineTo(600, 0); p.lineTo(300, 700); p.close(); return p; })() })] });
+  const mini = opentype.parse(minimal.toArrayBuffer());
+  const without = T.layout(mini, 'AB', { size: 100 });
+  const withFb = T.layout(mini, 'AB', { size: 100, fallback: lato, fallbackScale: 1 });
+  assert.strictEqual(without.glyphs, 1);
+  assert.strictEqual(withFb.glyphs, 2);
+});
+
 console.log(passed + ' tests passed');

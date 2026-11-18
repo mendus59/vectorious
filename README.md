@@ -8,8 +8,9 @@ Convert raster images (PNG, JPG, WebP, GIF, BMP) or typed text into detailed SVG
 
 - Traces each color layer with a built-in Potrace implementation into smooth Bezier curves, with no AI and nothing uploaded.
 - Presets for photos, logos, small text and icons, line art and pixel art, with up to 128 colors.
-- Traces tiny, low-resolution text cleanly by upscaling it smoothly and dropping anti-aliasing blends.
+- Traces tiny, low-resolution text cleanly by upscaling it, dropping anti-aliasing blends and refining edges against the original pixels.
 - Turns typed text into vector outlines in 26 bundled fonts or your own, and finds the closest font to an image of text.
+- Builds a new font (.otf) from the lettering in an image, so custom lettering can be typed in its own style.
 - Splits the result into layers by color, shape, size or similar objects, and downloads any layer as an SVG.
 <!-- site-summary:end -->
 
@@ -44,11 +45,14 @@ Convert raster images (PNG, JPG, WebP, GIF, BMP) into detailed SVG vector graphi
 | Pixel-exact edges | Outputs exact pixel outlines with no curve fitting (pixel art) |
 | Smoothness | Potrace `alphamax`: 0 = all corners, 1.33 = all curves |
 | Simplify curves / tolerance | Potrace curve optimization |
+| Refine edges | Two-color results: fit the outlines to the original pixels (see below) |
 | Layering / Layer order | Stacked or cutout, and the stacking order |
 
 ### Small, low-resolution text
 
 Text a few pixels tall (a 139×25 banner, say) has strokes only one or two pixels wide, mostly made of anti-aliased edge pixels. Traced at its own size, k-means gives each shade of edge its own layer, the speckle filter removes the thin pieces, and Potrace rounds what is left into blobs. The **Small text / icon** preset upscales 8× with a smooth filter, so the anti-aliasing turns into sub-pixel edge positions, and uses *Pure colors*, so the output has the exact ink and background colors and true stroke weights. The app suggests it when you open an image under 400 px.
+
+Thresholding an upscaled image still puts each edge where the interpolated image crosses 50%, which rounds off thin strokes and small holes. **Refine edges** (on in that preset) then treats the outlines as a deformable curve: it renders them anti-aliased at the original resolution, compares the result with the original pixel by pixel, and moves each outline point along its normal to shrink the difference, with light smoothing to keep curves fair (inverse rendering; plain iterative optimisation, no learned model). On a 139×25 banner it raised the overlap with the original from 88% to 94%. It runs on results with exactly two colors and images up to 250,000 pixels.
 
 ## Text to vector
 
@@ -58,6 +62,7 @@ The **Text to vector** tab turns typed text into SVG outlines. Glyphs come strai
 - Size, letter spacing, width, line height, alignment, synthetic small caps, fill and background color.
 - **Fit this font to the image** places the text over an open image: it measures the ink (the background is the most common border color, the ink the most common color farthest from it), sizes the text to the ink, matches letter spacing to the width, centres it on the ink's centre of mass, and copies the colors.
 - **Find the closest font** runs that fit for every font, regular and small caps, and ranks them by the overlap (intersection over union) of the text with the ink. It is template matching, not machine learning, so it only knows the fonts it has; upload the original font if you have it.
+- **Make a font from this image** builds a new font from lettering no bundled font matches. It traces the image (with edge refinement), cuts it into letters left to right (shapes stacked over each other, like the dot of an i, join one letter; letters that touch are cut at their thinnest column, aimed by the width of another copy of the same letter), names them with the words you typed, and writes an OpenType font with opentype.js. Metrics come from the image: cap height and x-height, the baseline where most letters stop, side bearings from the median gap between letters, and the space from the gaps between words. Each letter's other case is scaled from it, and letters the image doesn't have can be borrowed from a bundled font, sized to match (as small capitals when the lettering uses small caps). The font is placed back over the image, kept in the font list on this device, and downloads as an .otf.
 - The Compare view puts the original under the new text, and downloads work like any other result.
 
 Bundled fonts (OFL or Apache licensed, from Google Fonts) are listed with their licenses in [fonts/README.md](fonts/README.md). They load only when used.

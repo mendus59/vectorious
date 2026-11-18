@@ -1043,6 +1043,259 @@
   }
 
   // ------------------------------------------------------------------
+  // Refining outlines against the original pixels
+  //
+  // Thresholding an upscaled image puts each edge where the interpolated
+  // image crosses 50%, which rounds off thin strokes and small holes. This
+  // pass treats the outlines as a deformable curve instead: it renders them
+  // anti-aliased at the original resolution, compares that with the
+  // original's coverage, and moves every outline point along its normal to
+  // shrink the difference, with a little smoothing to keep curves fair.
+  // Plain iterative optimisation (inverse rendering), no learned model.
+  // ------------------------------------------------------------------
+  var REFINE_MAX_PIXELS = 250000;
+
+  function dToPolys(d) {
+    var t = String(d).match(/[MLHVCZ]|-?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?/g) || [];
+    var polys = [], poly = null, i = 0, cmd = 'M', x = 0, y = 0;
+    function num() { return +t[i++]; }
+    while (i < t.length) {
+      if (/[A-Z]/.test(t[i])) cmd = t[i++];
+      if (cmd === 'M') { if (poly) polys.push(poly); x = num(); y = num(); poly = [x, y]; cmd = 'L'; }
+      else if (cmd === 'L') { x = num(); y = num(); poly.push(x, y); }
+      else if (cmd === 'H') { x = num(); poly.push(x, y); }
+      else if (cmd === 'V') { y = num(); poly.push(x, y); }
+      else if (cmd === 'C') {
+        var x1 = num(), y1 = num(), x2 = num(), y2 = num(), x3 = num(), y3 = num();
+        for (var k = 1; k <= 12; k++) {
+          var s = k / 12, u = 1 - s;
+          poly.push(u * u * u * x + 3 * u * u * s * x1 + 3 * u * s * s * x2 + s * s * s * x3,
+                    u * u * u * y + 3 * u * u * s * y1 + 3 * u * s * s * y2 + s * s * s * y3);
+        }
+        x = x3; y = y3;
+      } else if (cmd === 'Z') { if (poly) polys.push(poly); poly = null; }
+    }
+    if (poly) polys.push(poly);
+    return polys.filter(function (p) { return p.length >= 6; });
+  }
+
+  // Even spacing along a closed polygon.
+  function resamplePoly(p, step) {
+    var n = p.length / 2, seg = new Float64Array(n), L = 0, i;
+    for (i = 0; i < n; i++) {
+      var j = (i + 1) % n;
+      seg[i] = Math.hypot(p[j * 2] - p[i * 2], p[j * 2 + 1] - p[i * 2 + 1]);
+      L += seg[i];
+    }
+    var m = Math.max(8, Math.round(L / step)), out = new Float64Array(m * 2), acc = 0;
+    i = 0;
+    for (var k = 0; k < m; k++) {
+      var dd = k * L / m;
+      while (i < n - 1 && acc + seg[i] < dd) { acc += seg[i]; i++; }
+      var jj = (i + 1) % n, f = seg[i] ? (dd - acc) / seg[i] : 0;
+      out[k * 2] = p[i * 2] + f * (p[jj * 2] - p[i * 2]);
+      out[k * 2 + 1] = p[i * 2 + 1] + f * (p[jj * 2 + 1] - p[i * 2 + 1]);
+    }
+    return out;
+  }
+
+  function polyArea(p) {
+    var a = 0, n = p.length / 2;
+    for (var i = 0; i < n; i++) { var j = (i + 1) % n; a += p[i * 2] * p[j * 2 + 1] - p[j * 2] * p[i * 2 + 1]; }
+    return a / 2;
+  }
+
+  // Anti-aliased nonzero fill of polygons: coverage per pixel, ss x ss samples.
+  function rasterizePolys(polys, w, h, ss) {
+    var edges = [], W = w * ss, H = h * ss, cov = new Float32Array(w * h), inc = 1 / (ss * ss);
+    polys.forEach(function (p) {
+      var n = p.length / 2;
+      for (var i = 0; i < n; i++) {
+        var j = (i + 1) % n, x0 = p[i * 2] * ss, y0 = p[i * 2 + 1] * ss, x1 = p[j * 2] * ss, y1 = p[j * 2 + 1] * ss;
+        if (y0 === y1) continue;
+        var dir = 1;
+        if (y0 > y1) { var tx = x0, ty = y0; x0 = x1; y0 = y1; x1 = tx; y1 = ty; dir = -1; }
+        edges.push({ y0: y0, y1: y1, x0: x0, k: (x1 - x0) / (y1 - y0), dir: dir });
+      }
+    });
+    edges.sort(function (a, b) { return a.y0 - b.y0; });
+    var active = [], next = 0, xs = [];
+    for (var Y = 0; Y < H; Y++) {
+      var sy = Y + 0.5;
+      while (next < edges.length && edges[next].y0 <= sy) active.push(edges[next++]);
+      xs.length = 0;
+      for (var a = active.length - 1; a >= 0; a--) {
+        var e = active[a];
+        if (e.y1 <= sy) { active.splice(a, 1); continue; }
+        xs.push(e.x0 + (sy - e.y0) * e.k, e.dir);
+      }
+      if (!xs.length) continue;
+      var pairs = [];
+      for (var q = 0; q < xs.length; q += 2) pairs.push([xs[q], xs[q + 1]]);
+      pairs.sort(function (u, v) { return u[0] - v[0]; });
+      var wind = 0, row = ((Y / ss) | 0) * w;
+      for (q = 0; q < pairs.length - 1; q++) {
+        wind += pairs[q][1];
+        if (!wind) continue;
+        var from = Math.max(0, Math.ceil(pairs[q][0] - 0.5)), to = Math.min(W - 1, Math.ceil(pairs[q + 1][0] - 0.5) - 1);
+        for (var X = from; X <= to; X++) cov[row + ((X / ss) | 0)] += inc;
+      }
+    }
+    return cov;
+  }
+
+  /**
+   * Move outline points so the outlines, drawn anti-aliased at w x h, match
+   * `target` (0..1 coverage per pixel). `sets` is an array of polygon lists
+   * (one per object); all are refined together and returned in the same shape.
+   */
+  function refinePolys(sets, target, w, h, o) {
+    o = o || {};
+    var iters = o.iterations || 60, lr = o.rate || 0.4, smooth = o.smooth == null ? 0.3 : o.smooth;
+    var all = [], owner = [];
+    sets.forEach(function (polys, si) {
+      polys.forEach(function (p) {
+        p = resamplePoly(p, 0.15);
+        // points within a third of a pixel of the image border go onto it (stacked layers' frames)
+        for (var i = 0; i < p.length; i += 2) {
+          if (p[i] < 0.35) p[i] = 0; else if (p[i] > w - 0.35) p[i] = w;
+          if (p[i + 1] < 0.35) p[i + 1] = 0; else if (p[i + 1] > h - 0.35) p[i + 1] = h;
+        }
+        all.push(p); owner.push(si);
+      });
+    });
+    if (!all.length) return sets;
+    var big = 0;
+    for (var b = 1; b < all.length; b++) if (Math.abs(polyArea(all[b])) > Math.abs(polyArea(all[big]))) big = b;
+    var orient = polyArea(all[big]) > 0 ? 1 : -1; // outlines and holes wind opposite ways
+    var R = new Float32Array(w * h);
+    function residual(x, y) {
+      x -= 0.5; y -= 0.5;
+      var x0 = Math.floor(x), y0 = Math.floor(y), fx = x - x0, fy = y - y0, s = 0;
+      for (var dy = 0; dy < 2; dy++) for (var dx = 0; dx < 2; dx++) {
+        var X = x0 + dx, Y = y0 + dy;
+        if (X >= 0 && X < w && Y >= 0 && Y < h) s += (dx ? fx : 1 - fx) * (dy ? fy : 1 - fy) * R[Y * w + X];
+      }
+      return s;
+    }
+    function step(p, dataTerm, sm) {
+      var n = p.length / 2, q = new Float64Array(p.length);
+      for (var i = 0; i < n; i++) {
+        var a = (i - 1 + n) % n, c = (i + 1) % n;
+        var px = p[i * 2], py = p[i * 2 + 1], tx = p[c * 2] - p[a * 2], ty = p[c * 2 + 1] - p[a * 2 + 1];
+        if (px <= 0.01 || py <= 0.01 || px >= w - 0.01 || py >= h - 0.01) {
+          // points on the image border stay there (a stacked layer's outer frame)
+          q[i * 2] = px <= 0.01 ? 0 : px >= w - 0.01 ? w : px;
+          q[i * 2 + 1] = py <= 0.01 ? 0 : py >= h - 0.01 ? h : py;
+          continue;
+        }
+        var l = Math.hypot(tx, ty) || 1, nx = ty / l * orient, ny = -tx / l * orient;
+        var r = dataTerm ? residual(px, py) : 0;
+        q[i * 2] = Math.min(w, Math.max(0, px - lr * r * nx + sm * ((p[a * 2] + p[c * 2]) / 2 - px)));
+        q[i * 2 + 1] = Math.min(h, Math.max(0, py - lr * r * ny + sm * ((p[a * 2 + 1] + p[c * 2 + 1]) / 2 - py)));
+      }
+      return q;
+    }
+    for (var it = 0; it < iters; it++) {
+      var cov = rasterizePolys(all, w, h, 4);
+      for (var i = 0; i < w * h; i++) R[i] = (cov[i] > 1 ? 1 : cov[i]) - target[i];
+      for (var k = 0; k < all.length; k++) {
+        all[k] = step(all[k], true, smooth);
+        if (it % 5 === 4) all[k] = resamplePoly(all[k], 0.15);
+      }
+    }
+    for (var f = 0; f < 4; f++) for (k = 0; k < all.length; k++) all[k] = step(all[k], false, 0.5);
+    var out = sets.map(function () { return []; });
+    all.forEach(function (p, pi) { if (Math.abs(polyArea(p)) > 0.05) out[owner[pi]].push(restoreCorners(p, w, h)); });
+    return out;
+  }
+
+  // Even resampling can step past an image corner; put it back where a
+  // polygon runs from one border straight onto the next.
+  function restoreCorners(p, w, h) {
+    var n = p.length / 2, out = [];
+    function side(x, y) { return y === 0 ? 'T' : x === w ? 'R' : y === h ? 'B' : x === 0 ? 'L' : ''; }
+    var corners = { TR: [w, 0], RT: [w, 0], RB: [w, h], BR: [w, h], BL: [0, h], LB: [0, h], LT: [0, 0], TL: [0, 0] };
+    for (var i = 0; i < n; i++) {
+      var j = (i + 1) % n, x = p[i * 2], y = p[i * 2 + 1];
+      out.push(x, y);
+      var c = corners[side(x, y) + side(p[j * 2], p[j * 2 + 1])];
+      if (c) out.push(c[0], c[1]);
+    }
+    return out.length === p.length ? p : new Float64Array(out);
+  }
+
+  // Closed polygon -> smooth path data: Douglas-Peucker, then Catmull-Rom cubics.
+  function polysToD(polys, fmt, tol, bw, bh) {
+    var out = '';
+    polys.forEach(function (p) {
+      var pts = simplifyClosed(p, tol || 0.03), n = pts.length / 2;
+      if (n < 3) return;
+      function P(i) { i = (i + n) % n; return [pts[i * 2], pts[i * 2 + 1]]; }
+      // a vertex that turns more than 60 degrees is a corner: no tangent handle
+      var corner = new Uint8Array(n);
+      for (var c = 0; c < n; c++) {
+        var a0 = P(c - 1), a1 = P(c), a2 = P(c + 1);
+        var ux1 = a1[0] - a0[0], uy1 = a1[1] - a0[1], ux2 = a2[0] - a1[0], uy2 = a2[1] - a1[1];
+        var cosT = (ux1 * ux2 + uy1 * uy2) / ((Math.hypot(ux1, uy1) * Math.hypot(ux2, uy2)) || 1);
+        corner[c] = cosT < 0.5 ? 1 : 0;
+      }
+      out += 'M' + fmt(pts[0]) + ' ' + fmt(pts[1]);
+      for (var i = 0; i < n; i++) {
+        var p0 = P(i - 1), p1 = P(i), p2 = P(i + 1), p3 = P(i + 2);
+        var k1 = corner[i] ? 0 : 1 / 6, k2 = corner[(i + 1) % n] ? 0 : 1 / 6;
+        var e = 0.02 * (bw ? Math.max(1, bw / 1000) : 1), along = bw && ((Math.abs(p1[0]) < e && Math.abs(p2[0]) < e) || (Math.abs(p1[1]) < e && Math.abs(p2[1]) < e) ||
+          (Math.abs(p1[0] - bw) < e && Math.abs(p2[0] - bw) < e) || (Math.abs(p1[1] - bh) < e && Math.abs(p2[1] - bh) < e));
+        if (along || (!k1 && !k2)) { out += 'L' + fmt(p2[0]) + ' ' + fmt(p2[1]); continue; }
+        // keep each handle within a third of this segment, so long neighbours cannot overshoot it
+        var segL = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]);
+        var h1x = (p2[0] - p0[0]) * k1, h1y = (p2[1] - p0[1]) * k1, h2x = (p3[0] - p1[0]) * k2, h2y = (p3[1] - p1[1]) * k2;
+        var l1 = Math.hypot(h1x, h1y), l2 = Math.hypot(h2x, h2y);
+        if (l1 > segL / 3) { h1x *= segL / 3 / l1; h1y *= segL / 3 / l1; }
+        if (l2 > segL / 3) { h2x *= segL / 3 / l2; h2y *= segL / 3 / l2; }
+        out += 'C' + fmt(p1[0] + h1x) + ' ' + fmt(p1[1] + h1y) + ' ' +
+          fmt(p2[0] - h2x) + ' ' + fmt(p2[1] - h2y) + ' ' + fmt(p2[0]) + ' ' + fmt(p2[1]);
+      }
+      out += 'Z';
+    });
+    return out;
+  }
+  function simplifyClosed(p, tol) {
+    var n = p.length / 2, keep = new Uint8Array(n);
+    // split at the point farthest from the start, then simplify both halves
+    var far = 0, fd = -1;
+    for (var i = 1; i < n; i++) { var dd = Math.hypot(p[i * 2] - p[0], p[i * 2 + 1] - p[1]); if (dd > fd) { fd = dd; far = i; } }
+    keep[0] = keep[far] = 1;
+    function dp(a, b) {
+      var ax = p[a * 2], ay = p[a * 2 + 1], bx = p[(b % n) * 2], by = p[(b % n) * 2 + 1];
+      var dx = bx - ax, dy = by - ay, L = Math.hypot(dx, dy) || 1e-9, best = -1, bd = tol;
+      for (var k = a + 1; k < b; k++) {
+        var d = Math.abs((p[(k % n) * 2] - ax) * dy - (p[(k % n) * 2 + 1] - ay) * dx) / L;
+        if (d > bd) { bd = d; best = k; }
+      }
+      if (best >= 0) { keep[best % n] = 1; dp(a, best); dp(best, b); }
+    }
+    dp(0, far); dp(far, n);
+    var out = [];
+    for (i = 0; i < n; i++) if (keep[i]) out.push(p[i * 2], p[i * 2 + 1]);
+    return out;
+  }
+
+  // Coverage of `color` per source pixel, for a two-color result: how far each
+  // pixel sits from the other color towards this one.
+  function coverageOf(src, w, h, color, other, alphaCut) {
+    var cov = new Float32Array(w * h);
+    var dr = color[0] - other[0], dg = color[1] - other[1], db = color[2] - other[2], L = dr * dr + dg * dg + db * db;
+    for (var i = 0; i < w * h; i++) {
+      if (src[i * 4 + 3] < alphaCut) continue;
+      if (!L) { cov[i] = 1; continue; }
+      var t = ((src[i * 4] - other[0]) * dr + (src[i * 4 + 1] - other[1]) * dg + (src[i * 4 + 2] - other[2]) * db) / L;
+      cov[i] = t < 0 ? 0 : t > 1 ? 1 : t;
+    }
+    return cov;
+  }
+
+  // ------------------------------------------------------------------
   // Color quantization
   // ------------------------------------------------------------------
   var TRANSPARENT = 0xFFFF;
@@ -1276,6 +1529,7 @@
     upscale: 1,           // enlarge the bitmap this much before tracing (small text, icons)
     resample: 'smooth',   // upscale method: 'smooth' (bicubic) | 'scale2x' (pixel art) | 'nearest'
     pureColors: false,    // palette = most common exact source color per cluster, not the mean
+    refine: false,        // two-color results: fit outlines to the original pixels (inverse rendering)
     autoThreshold: false, // 'bw': pick the threshold with Otsu's method
     outWidth: 0,          // SVG width in user units (defaults to bitmap width)
     outHeight: 0,
@@ -1361,7 +1615,8 @@
         var f = shapeFeatures(ob.outer, sx * sy);
         f.holes = ob.holes.length;
         f.net = net;
-        objects.push({ d: d, color: color, f: f });
+        var oo = ob.outer;
+        objects.push({ d: d, color: color, f: f, bbox: { x1: oo.minX * sx, y1: oo.minY * sy, x2: oo.maxX * sx, y2: oo.maxY * sy } });
       }
     }
 
@@ -1418,6 +1673,9 @@
       var keyOf = o.order === 'lightness'
         ? function (ix) { return o.lightFirst ? -lumOf(palette[ix]) : lumOf(palette[ix]); }
         : function (ix) { return -counts[ix]; };
+      // Refining two colors: put the larger one (the background) at the bottom, so
+      // the refined layer is the artwork itself rather than a frame around it.
+      if (o.refine && !o.pixelExact && present.length === 2) keyOf = function (ix) { return -counts[ix]; };
 
       var lmask = new Uint8Array(n), li;
       if (objectMode) {
@@ -1469,6 +1727,70 @@
       }
     }
 
+    // --- optional refinement against the original pixels (two-color results)
+    var refined = null;
+    if (o.refine && !o.pixelExact) refined = refineResult();
+    function refineResult() {
+      var sw = source.width, sh = source.height;
+      if (sw * sh > REFINE_MAX_PIXELS) return 'image too large';
+      var colors = [], seenC = {};
+      function note(c) { var k = hex(c); if (!seenC[k]) { seenC[k] = 1; colors.push(c); } }
+      if (background) note(background);
+      colorLayers.forEach(function (cl) { cl.items.forEach(function (it) { note(it.color); }); });
+      objects.forEach(function (ob) { note(ob.color); });
+      if (o.mode === 'bw' && colors.length === 1) note(o.invert ? [0, 0, 0] : [255, 255, 255]);
+      if (colors.length !== 2) return 'needs exactly two colors';
+      var src = source.data, ux = outW / sw, uy = outH / sh, cut = o.alphaThreshold == null ? 128 : o.alphaThreshold;
+      var srcForCov = src;
+      if (o.mode === 'bw') {
+        // black & white output colors are not the image's colors: measure coverage on luminance
+        srcForCov = new Uint8ClampedArray(src.length);
+        var lo = 255, hi = 0;
+        for (var q = 0; q < sw * sh; q++) {
+          var lum = 0.2126 * src[q * 4] + 0.7152 * src[q * 4 + 1] + 0.0722 * src[q * 4 + 2];
+          srcForCov[q * 4] = srcForCov[q * 4 + 1] = srcForCov[q * 4 + 2] = lum; srcForCov[q * 4 + 3] = src[q * 4 + 3];
+        }
+        var t0 = threshold == null ? 128 : threshold, hist = new Float64Array(256);
+        for (q = 0; q < sw * sh; q++) if (src[q * 4 + 3] >= cut) hist[srcForCov[q * 4] | 0]++;
+        var pd = 0, pl = 255, nd = -1, nl = -1;
+        for (q = 0; q < 256; q++) {
+          if (q < t0 && hist[q] > nd) { nd = hist[q]; pd = q; }
+          if (q >= t0 && hist[q] > nl) { nl = hist[q]; pl = q; }
+        }
+        lo = pd; hi = pl;
+        var inkDark = !o.invert;
+        var targetCov = function (color) {
+          var dark = color[0] < 128;
+          return coverageOf(srcForCov, sw, sh, dark === inkDark ? (inkDark ? [lo, lo, lo] : [hi, hi, hi]) : (inkDark ? [hi, hi, hi] : [lo, lo, lo]),
+            dark === inkDark ? (inkDark ? [hi, hi, hi] : [lo, lo, lo]) : (inkDark ? [lo, lo, lo] : [hi, hi, hi]), cut);
+        };
+      } else {
+        var targetCov = function (color) {
+          return coverageOf(src, sw, sh, color, hex(color) === hex(colors[0]) ? colors[1] : colors[0], cut);
+        };
+      }
+      function toSrc(polys) { return polys.map(function (p) { var r = new Float64Array(p.length); for (var i = 0; i < p.length; i += 2) { r[i] = p[i] / ux; r[i + 1] = p[i + 1] / uy; } return r; }); }
+      function toOut(polys) { return polys.map(function (p) { var r = new Float64Array(p.length); for (var i = 0; i < p.length; i += 2) { r[i] = p[i] * ux; r[i + 1] = p[i + 1] * uy; } return r; }); }
+      var byColor = {};
+      colorLayers.forEach(function (cl) { cl.items.forEach(function (it) { if (it.d) (byColor[hex(it.color)] = byColor[hex(it.color)] || { color: it.color, list: [] }).list.push(it); }); });
+      objects.forEach(function (ob) { (byColor[hex(ob.color)] = byColor[hex(ob.color)] || { color: ob.color, list: [] }).list.push(ob); });
+      Object.keys(byColor).forEach(function (k, ki) {
+        progress('Refining edges', ki / 2);
+        var entry = byColor[k], sets = entry.list.map(function (it) { return toSrc(dToPolys(it.d)); });
+        var out = refinePolys(sets, targetCov(entry.color), sw, sh);
+        entry.list.forEach(function (it, ii) {
+          var polys = toOut(out[ii]);
+          it.d = polysToD(polys, fmt, 0.06 * Math.max(ux, uy), outW, outH);
+          if (it.bbox) {
+            var x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+            polys.forEach(function (p) { for (var i = 0; i < p.length; i += 2) { x1 = Math.min(x1, p[i]); x2 = Math.max(x2, p[i]); y1 = Math.min(y1, p[i + 1]); y2 = Math.max(y2, p[i + 1]); } });
+            if (x1 !== Infinity) it.bbox = { x1: x1, y1: y1, x2: x2, y2: y2 };
+          }
+        });
+      });
+      return true;
+    }
+
     progress('Grouping layers', 1);
     var defs = [];  // bottom to top: { name, items }
     if (background) defs.push({ name: 'Background', items: [{ color: background, rect: true }] });
@@ -1517,11 +1839,15 @@
       svg: svg,
       open: open,
       layers: outLayers,
+      objects: o.returnObjects && objectMode ? objects.map(function (ob) {
+        return { d: ob.d, color: hex(ob.color), bbox: ob.bbox, area: ob.f.net * sx * sy };
+      }) : undefined,
       palette: usedPalette,
       stats: {
         width: w,
         height: h,
         threshold: o.mode === 'bw' ? threshold : undefined,
+        refined: refined === true ? true : refined ? refined : undefined,
         colors: usedPalette.length,
         layers: outLayers.length,
         paths: pathCount,
@@ -1855,6 +2181,10 @@
     mergeSpeckles: mergeSpeckles,
     buildSvg: buildSvg,
     resample: resample,
+    refinePolys: refinePolys,
+    polysToD: polysToD,
+    dToPolys: dToPolys,
+    rasterizePolys: rasterizePolys,
     otsuThreshold: otsuThreshold,
     DEFAULTS: DEFAULTS
   };
