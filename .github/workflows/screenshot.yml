@@ -1,0 +1,27 @@
+# Retakes docs/screenshot.jpg from the live app whenever a new version goes out, so the README and this
+# project's card on https://mendus59.github.io always show the current app. Runs after each Pages deploy
+# started by a push (not scheduled data refreshes), on each published release, and on demand. The shared
+# workflow only commits when the picture changed noticeably and uploads no artifacts.
+name: Screenshot
+
+on:
+  workflow_run:
+    workflows: ["Deploy to GitHub Pages"]
+    types: [completed]
+    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+concurrency:
+  group: screenshot
+  cancel-in-progress: true
+
+jobs:
+  screenshot:
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event != 'schedule')
+    uses: mendus59/mendus59.github.io/.github/workflows/project-screenshot.yml@main
+    permissions:
+      contents: write
+    with:
+      url: https://mendus59.github.io/vectorious/
