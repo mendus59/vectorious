@@ -14,6 +14,9 @@ Convert raster images (PNG, JPG, WebP, GIF, BMP) or typed text into detailed SVG
 - Splits the result into layers by color, shape, size or similar objects, and downloads any layer as an SVG.
 <!-- site-summary:end -->
 
+<!-- site-screenshot: docs/screenshot.jpg -->
+![Screenshot of Vectorious](docs/screenshot.jpg)
+
 Convert raster images (PNG, JPG, WebP, GIF, BMP) into detailed SVG vector graphics, entirely in the browser.
 
 - **No AI.** Conversion uses classic, deterministic algorithms only.

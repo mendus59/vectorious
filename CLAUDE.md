@@ -12,3 +12,7 @@ Whenever a change adds, removes or noticeably changes something a user can see o
 - Describe what is on `main` now, not plans.
 
 The `Site summary` workflow checks the section's format on every pull request (`node sync-summaries.mjs --check README.md`, from the site repo's `scripts/`).
+
+## Screenshot
+
+`docs/screenshot.jpg` is retaken from the live app by the `Screenshot` workflow after each deploy and release, and shown in the README and on this project's card on https://mendus59.github.io. Don't edit it by hand; run the workflow from the Actions tab to refresh it.
